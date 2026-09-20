@@ -17,6 +17,6 @@
     "typescript": "^5.9.3"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions/pi-rephrase-input.ts"]
   }
 }
