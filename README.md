@@ -19,7 +19,7 @@ pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input
 For a local checkout:
 
 ```bash
-pi install /Users/aungmyokyaw/projects/life/pi-rephrase-input
+pi install /path/to/pi-rephrase-input
 ```
 
 Verify the installed package:
