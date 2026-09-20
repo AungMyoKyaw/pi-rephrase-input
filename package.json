@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Context-aware input rephrasing for Pi coding agent.",
+  "license": "AGPL-3.0-or-later",
   "keywords": ["pi-package"],
   "scripts": {
     "check": "tsc -p tsconfig.json",

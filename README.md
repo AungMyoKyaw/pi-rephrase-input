@@ -56,3 +56,7 @@ python3 -m http.server 4173 --directory site
 ```
 
 Open `http://localhost:4173` to preview the product site.
+
+## License
+
+This project is licensed under [AGPL-3.0-or-later](LICENSE).
