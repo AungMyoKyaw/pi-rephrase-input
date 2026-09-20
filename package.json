@@ -1,0 +1,22 @@
+{
+  "name": "pi-rephrase-input",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Context-aware input rephrasing for Pi coding agent.",
+  "keywords": ["pi-package"],
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "bun test extensions"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@types/node": "^22.20.3",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
