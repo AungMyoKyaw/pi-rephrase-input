@@ -4,6 +4,10 @@ Context-aware input rephrasing for [Pi](https://pi.dev).
 
 Pi Rephrase Input intercepts ordinary user prompts, asks the active model which project files matter, then rewrites the request into a clear, actionable prompt. It keeps Pi's normal flow when disabled, interrupted, unavailable, or when rephrasing fails.
 
+<p align="center">
+  <img src="./site/pi-rephrase-input-overview.png" alt="Pi Rephrase Input workflow overview" width="1448" height="1086" />
+</p>
+
 ## Install
 
 This repository is private. Install from GitHub after authenticating Git access:

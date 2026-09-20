@@ -72,7 +72,10 @@
    ============================================================ */
 
 *, *::before, *::after { box-sizing: border-box; }
-html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+html { -webkit-text-size-adjust: 100%; }
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
 body {
   margin: 0;
   background: var(--color-neutral);
@@ -112,7 +115,8 @@ hr { border: 0; margin: 0; }
 }
 .skip-link:focus-visible {
   transform: translateY(0);
-  outline: none;
+  outline: 2px solid var(--color-tertiary);
+  outline-offset: 2px;
 }
 
 /* ============================================================
@@ -493,6 +497,7 @@ hr { border: 0; margin: 0; }
 .section {
   padding: var(--s-9) 0;
   border-top: 1px solid var(--color-rule);
+  scroll-margin-top: var(--s-7);
 }
 
 .section:first-of-type { border-top: 0; }
@@ -505,7 +510,8 @@ hr { border: 0; margin: 0; }
   margin-bottom: var(--s-7);
 }
 
-.section-head h2 {
+.section-head h2,
+.install-panel h2 {
   font-size: var(--fs-h2);
   font-weight: var(--fw-semibold);
   line-height: var(--lh-h2);
@@ -725,6 +731,13 @@ hr { border: 0; margin: 0; }
   letter-spacing: 0.01em;
 }
 
+.meta-sep {
+  display: inline-block;
+  margin: 0 var(--s-2);
+  color: var(--color-tertiary);
+  font-weight: var(--fw-medium);
+}
+
 .install-alt code,
 .install-verify code {
   color: var(--color-primary);
@@ -753,13 +766,19 @@ hr { border: 0; margin: 0; }
 
 .site-footer .nav-external {
   color: var(--color-primary);
+  transition: color 140ms ease;
+}
+
+.site-footer .nav-external:hover,
+.site-footer .nav-external:focus-visible {
+  color: var(--color-tertiary);
 }
 
 /* ============================================================
    Reveal-on-scroll
    ============================================================ */
 
-[data-reveal] {
+.js [data-reveal] {
   opacity: 0;
   transform: translateY(8px);
   transition: opacity 520ms ease, transform 520ms ease;
@@ -800,21 +819,16 @@ hr { border: 0; margin: 0; }
     grid-template-columns: 1fr 1fr;
   }
 
-  .proof-cell:nth-child(2) {
+  .proof-cell {
+    border-right: 1px solid var(--color-rule);
+  }
+
+  .proof-cell:nth-child(2n) {
     border-right: 0;
   }
 
-  .proof-cell:nth-child(-n+2) {
-    border-bottom: 1px solid var(--color-rule);
-  }
-
-  .proof-cell:nth-child(3),
-  .proof-cell:nth-child(4) {
+  .proof-cell:nth-child(n+3) {
     border-top: 1px solid var(--color-rule);
-  }
-
-  .proof-cell:nth-child(3) {
-    border-top: 0;
   }
 
   .section-head {
@@ -832,8 +846,48 @@ hr { border: 0; margin: 0; }
     gap: var(--s-2);
   }
 
-  .config-table td.config-desc {
-    padding-left: var(--s-3);
+  .config-table,
+  .config-table thead,
+  .config-table tbody,
+  .config-table tr,
+  .config-table th,
+  .config-table td {
+    display: block;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .config-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .config-table tr {
+    padding: var(--s-4) 0;
+    border-bottom: 1px solid var(--color-rule);
+  }
+
+  .config-table tr:last-child {
+    border-bottom: 0;
+  }
+
+  .config-table td + td {
+    margin-top: var(--s-2);
+  }
+
+  .config-table td.config-default {
+    text-align: left;
+    padding-right: 0;
+    width: auto;
+    white-space: normal;
   }
 
   .install-panel {
@@ -916,6 +970,6 @@ hr { border: 0; margin: 0; }
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-  [data-reveal] { opacity: 1; transform: none; }
+  .js [data-reveal] { opacity: 1; transform: none; }
   .cursor-block { animation: none; }
 }
