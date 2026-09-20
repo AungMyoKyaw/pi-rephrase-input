@@ -9,7 +9,7 @@ Pi Rephrase Input intercepts ordinary user prompts, asks the active model which 
 This repository is private. Install from GitHub after authenticating Git access:
 
 ```bash
-pi install git:github.com/AungMyoKyaw/pi-rephrase-input
+pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input
 ```
 
 For a local checkout:
