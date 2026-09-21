@@ -6,7 +6,7 @@
   "keywords": ["pi-package"],
   "scripts": {
     "check": "tsc -p tsconfig.json",
-    "test": "bun test extensions"
+    "test": "bun test"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
@@ -17,6 +17,6 @@
     "typescript": "^5.9.3"
   },
   "pi": {
-    "extensions": ["./extensions/pi-rephrase-input.ts"]
+    "extensions": ["./extensions/pi-rephrase-input.ts", "!./extensions/*.test.ts"]
   }
 }

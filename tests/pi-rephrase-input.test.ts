@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import rephraseInput from "./pi-rephrase-input.ts";
+import rephraseInput from "../extensions/pi-rephrase-input.ts";
 
 type Completion = {
 	stopReason?: string;
