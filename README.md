@@ -10,10 +10,10 @@ Pi Rephrase Input intercepts ordinary user prompts, asks the active model which 
 
 ## Install
 
-This repository is private. Install from GitHub after authenticating Git access:
+This repository is private and uses `master` as its default branch. Install from GitHub after authenticating Git access:
 
 ```bash
-pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input
+pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input@master
 ```
 
 For a local checkout:
