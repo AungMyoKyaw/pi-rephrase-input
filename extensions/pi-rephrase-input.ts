@@ -78,11 +78,28 @@ type ToolResultSnapshot = {
 	text: string;
 };
 
+type HistoryDepth = "none" | "light" | "heavy";
+type FollowUpResult = boolean | null;
+
 const MAX_CONVERSATION_TURNS = 6;
 const MAX_TOOL_RESULT_SNAPSHOTS = 3;
 const MAX_CONVERSATION_CHARS = 2000;
 const MAX_TOOL_RESULT_CHARS = 1000;
 const MAX_REPHRASE_HISTORY = 1;
+const LIGHT_HISTORY_TURNS = 2;
+const MAX_CLASSIFIER_CACHE_ENTRIES = 16;
+const CLASSIFIER_TURNS_TO_CONSIDER = 3;
+
+const FOLLOW_UP_CLASSIFIER_SYSTEM_PROMPT = `Decide whether the user's latest message depends on prior conversation context.
+
+Reply with exactly one word: YES or NO. No other text, punctuation, explanation, or markdown.
+
+YES = the message refers to prior turns (pronouns like "that/it/this/above", phrases like "fix the previous one", "do the same", "also try that", or anything not understandable without context).
+
+NO = the message stands alone and can be understood with no prior context.`;
+
+const FALLBACK_FOLLOW_UP_SIGNAL =
+	/\b(that|this|those|above|same|also|fix it|do it|again|too|either|previous|earlier)\b/i;
 
 // ──────────────────────────────────────────────────────────────
 // Single exported extension function — every helper below is a
@@ -94,6 +111,7 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	const conversationBuffer: ConversationTurn[] = [];
 	const toolResultBuffer: ToolResultSnapshot[] = [];
 	const rephraseHistory: string[] = [];
+	const followUpCache = new Map<string, boolean>();
 
 	function rememberRephrase(text: string): void {
 		rephraseHistory.push(text);
@@ -118,10 +136,14 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		}
 	}
 
-	function formatConversationContext(): string {
-		if (conversationBuffer.length === 0) return "";
+	function formatConversationContext(depth: HistoryDepth): string {
+		if (depth === "none" || conversationBuffer.length === 0) return "";
+		const turns =
+			depth === "light"
+				? conversationBuffer.slice(-LIGHT_HISTORY_TURNS)
+				: conversationBuffer;
 		const lines: string[] = ["Recent conversation (oldest first):"];
-		for (const turn of conversationBuffer) {
+		for (const turn of turns) {
 			const tag = turn.role === "user" ? "U" : "A";
 			lines.push(`${tag}: ${turn.text}`);
 		}
@@ -135,8 +157,8 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		return tail.startsWith(header) ? tail : `${header}\n${tail}`;
 	}
 
-	function formatToolResultContext(): string {
-		if (toolResultBuffer.length === 0) return "";
+	function formatToolResultContext(depth: HistoryDepth): string {
+		if (depth === "none" || toolResultBuffer.length === 0) return "";
 		const lines: string[] = ["Recent tool results:"];
 		for (const snap of toolResultBuffer) {
 			lines.push(`[${snap.toolName}]: ${snap.text}`);
@@ -191,6 +213,7 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		conversationBuffer.length = 0;
 		toolResultBuffer.length = 0;
 		rephraseHistory.length = 0;
+		followUpCache.clear();
 	});
 
 	// turn_end: capture the assistant message and tool results from
@@ -240,6 +263,9 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	const MAX_CONTEXT_FILE_SIZE = 200_000;
 	const MAX_CONTEXT_CANDIDATES = 500;
 	const MAX_SELECTED_CONTEXT_FILES = 8;
+	const MAX_CLASSIFIER_TIMEOUT_MS = 2500;
+	const DEFAULT_MAX_RETRIES = 2;
+	const DEFAULT_RETRY_BASE_MS = 500;
 
 	const SKIPPED_CONTEXT_DIRECTORIES = new Set([
 		".git",
@@ -444,6 +470,88 @@ Rules:
 		};
 	}
 
+	// ── Retry helpers — exponential backoff with jitter, bounded
+	// attempts. Each attempt owns its own timeout-bounded signal; the
+	// per-call timeout (PI_REPHRASE_TIMEOUT_MS) is preserved per attempt.
+	// Operations throw on transient errors (timeout); withRetry catches
+	// and retries. Operations return null/[] on permanent failures (no
+	// model, auth missing, empty response, stopReason="error"). On retry
+	// exhaustion withRetry returns the operation's null/[] so callers
+	// keep their existing fallback paths.
+
+	function computeRetryBackoff(attempt: number, baseMs: number): number {
+		const cap = baseMs * 2 ** (attempt - 1);
+		return Math.floor(Math.random() * cap);
+	}
+
+	function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+		return new Promise((resolve, reject) => {
+			if (signal?.aborted) {
+				reject(new Error("aborted"));
+				return;
+			}
+			const timer = setTimeout(() => {
+				signal?.removeEventListener("abort", onAbort);
+				resolve();
+			}, ms);
+			const onAbort = (): void => {
+				clearTimeout(timer);
+				reject(new Error("aborted"));
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+		});
+	}
+
+	async function withRetry<T>(
+		operation: (signal: AbortSignal) => Promise<T | null>,
+		options: {
+			maxRetries: number;
+			baseMs: number;
+			timeoutMs: number;
+			signal?: AbortSignal;
+			label: string;
+			debug: boolean;
+		},
+	): Promise<T | null> {
+		const maxAttempts = Math.max(1, options.maxRetries + 1);
+		let lastErr: unknown;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			if (options.signal?.aborted) return null;
+
+			const ac = new AbortController();
+			const timer = setTimeout(() => ac.abort(), Math.max(1, options.timeoutMs));
+			const unlinkUser = linkAbortSignals(options.signal, ac);
+
+			try {
+				return await operation(ac.signal);
+			} catch (err) {
+				lastErr = err;
+				if (options.signal?.aborted) return null;
+				if (attempt >= maxAttempts) break;
+				const backoff = computeRetryBackoff(attempt, options.baseMs);
+				if (options.debug) {
+					process.stderr.write(
+						`[rephrase-retry] ${options.label} attempt ${attempt}/${maxAttempts} failed (${(err as Error).message ?? err}); retrying in ${backoff}ms\n`,
+					);
+				}
+				try {
+					await sleepWithSignal(backoff, options.signal);
+				} catch {
+					return null;
+				}
+			} finally {
+				clearTimeout(timer);
+				unlinkUser();
+			}
+		}
+		if (options.debug && lastErr) {
+			process.stderr.write(
+				`[rephrase-retry] ${options.label} exhausted ${maxAttempts} attempts (${(lastErr as Error).message ?? lastErr})\n`,
+			);
+		}
+		return null;
+	}
+
 	// ── Selection — LLM call to pick files ─────────────────────
 
 	async function selectContextFiles(
@@ -452,60 +560,140 @@ Rules:
 		cwd: string,
 		originalText: string,
 		candidates: readonly ContextFileCandidate[],
-		timeoutMs: number,
-		userSignal: AbortSignal | undefined,
-	): Promise<string[]> {
+		signal: AbortSignal,
+	): Promise<string[] | null> {
 		const { text: inventory, listedCandidates } = formatCandidateInventory(candidates);
 		if (!inventory) return [];
 
-		const ac = new AbortController();
-		const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs));
-		const unlinkUser = linkAbortSignals(userSignal, ac);
+		const response = await modelRegistry.complete(
+			model,
+			{
+				systemPrompt: CONTEXT_SELECTION_SYSTEM_PROMPT,
+				messages: [
+					{
+						role: "user" as const,
+						content: [
+							{
+								type: "text" as const,
+								text: [
+									`Project cwd: ${cwd}`,
+									"Candidate files:",
+									inventory,
+									"",
+									"User request:",
+									originalText,
+								].join("\n"),
+							},
+						],
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{ signal },
+		);
 
-		try {
-			const response = await modelRegistry.complete(
-				model,
-				{
-					systemPrompt: CONTEXT_SELECTION_SYSTEM_PROMPT,
-					messages: [
-						{
-							role: "user" as const,
-							content: [
-								{
-									type: "text" as const,
-									text: [
-										`Project cwd: ${cwd}`,
-										"Candidate files:",
-										inventory,
-										"",
-										"User request:",
-										originalText,
-									].join("\n"),
-								},
-							],
-							timestamp: Date.now(),
-						},
-					],
-				},
-				{ signal: ac.signal },
-			);
-			if (response.stopReason === "aborted") return [];
+		// Throw on transient (timeout/user-abort) so withRetry can retry.
+		if (signal.aborted) throw new Error("selector aborted");
+		if (response.stopReason === "aborted") throw new Error("selector aborted");
+		// Permanent: provider error, no point retrying.
+		if (response.stopReason === "error") return null;
 
-			const allowed = new Set(listedCandidates.map((candidate) => candidate.path));
-			const selected: string[] = [];
-			for (const file of parseSelectedFiles(extractText(response))) {
-				const normalized = normalizeRelativePath(file);
-				if (!normalized || !allowed.has(normalized) || selected.includes(normalized)) continue;
-				selected.push(normalized);
-				if (selected.length >= MAX_SELECTED_CONTEXT_FILES) break;
-			}
-			return selected;
-		} catch {
-			return [];
-		} finally {
-			clearTimeout(timer);
-			unlinkUser();
+		const allowed = new Set(listedCandidates.map((candidate) => candidate.path));
+		const selected: string[] = [];
+		for (const file of parseSelectedFiles(extractText(response))) {
+			const normalized = normalizeRelativePath(file);
+			if (!normalized || !allowed.has(normalized) || selected.includes(normalized)) continue;
+			selected.push(normalized);
+			if (selected.length >= MAX_SELECTED_CONTEXT_FILES) break;
 		}
+		return selected;
+	}
+
+	// ── Follow-up classifier — single-token LLM call to detect
+	// whether the current input depends on prior conversation. Runs
+	// in parallel with the selector. Falls back to FALLBACK_FOLLOW_UP_SIGNAL
+	// on any failure so behavior degrades safely.
+
+	function pickHistoryDepth(
+		classifierResult: FollowUpResult,
+		bufferLength: number,
+		regexMatched: boolean,
+	): HistoryDepth {
+		const lightOrHeavy = bufferLength <= LIGHT_HISTORY_TURNS + 1 ? "light" : "heavy";
+		if (classifierResult === true) return lightOrHeavy;
+		if (classifierResult === false) return "none";
+		return regexMatched ? lightOrHeavy : "none";
+	}
+
+	function followUpCacheKey(
+		text: string,
+		conversation: readonly ConversationTurn[],
+	): string {
+		const trimmed = text.trim();
+		const recent = conversation.slice(-CLASSIFIER_TURNS_TO_CONSIDER);
+		return `${trimmed}\u241F${recent
+			.map((t) => `${t.role}:${t.text.slice(0, 200)}`)
+			.join("|")}`;
+	}
+
+	function cacheFollowUp(key: string, value: boolean): boolean {
+		if (followUpCache.size >= MAX_CLASSIFIER_CACHE_ENTRIES) {
+			const oldest = followUpCache.keys().next().value;
+			if (oldest !== undefined) followUpCache.delete(oldest);
+		}
+		followUpCache.set(key, value);
+		return value;
+	}
+
+	async function classifyFollowUpNeeded(
+		modelRegistry: ModelRegistryLike,
+		model: unknown,
+		originalText: string,
+		conversation: readonly ConversationTurn[],
+		signal: AbortSignal,
+	): Promise<FollowUpResult> {
+		if (conversation.length === 0) return false;
+		if (!model || !modelRegistry.hasConfiguredAuth?.(model)) return null;
+
+		const key = followUpCacheKey(originalText, conversation);
+		const cached = followUpCache.get(key);
+		if (cached !== undefined) return cached;
+
+		const recent = conversation.slice(-CLASSIFIER_TURNS_TO_CONSIDER);
+		const formatted = recent
+			.map((t) => `${t.role === "user" ? "U" : "A"}: ${t.text}`)
+			.join("\n");
+
+		const response = await modelRegistry.complete(
+			model,
+			{
+				systemPrompt: FOLLOW_UP_CLASSIFIER_SYSTEM_PROMPT,
+				messages: [
+					{
+						role: "user" as const,
+						content: [
+							{
+								type: "text" as const,
+								text: `Recent conversation:\n${formatted}\n\nLatest message:\n${originalText}`,
+							},
+						],
+						timestamp: Date.now(),
+					},
+				],
+			},
+			{ signal },
+		);
+
+		// Transient: throw so withRetry can retry.
+		if (signal.aborted) throw new Error("classifier aborted");
+		if (response.stopReason === "aborted") throw new Error("classifier aborted");
+		// Permanent: provider error, malformed output, or unparseable verdict.
+		if (response.stopReason === "error") return null;
+
+		const out = extractText(response).trim().toUpperCase();
+		if (out.startsWith("Y")) return cacheFollowUp(key, true);
+		if (out.startsWith("N")) return cacheFollowUp(key, false);
+		return null;
 	}
 
 	// ── Loading — read selected files, bounded by total chars ───
@@ -559,19 +747,15 @@ Rules:
 		originalText: string,
 		projectCtx: string,
 		repoName: string,
-		userSignal: AbortSignal | undefined,
-		timeoutMs: number,
+		signal: AbortSignal,
+		depth: HistoryDepth,
 	): Promise<string | null> {
 		const model = ctx.model;
 		if (!model) return null;
 		if (!ctx.modelRegistry.hasConfiguredAuth?.(model)) return null;
 
-		const ac = new AbortController();
-		const timer = setTimeout(() => ac.abort(), timeoutMs);
-		const unlinkUser = linkAbortSignals(userSignal, ac);
-
-		const conversationSection = formatConversationContext();
-		const toolResultSection = formatToolResultContext();
+		const conversationSection = formatConversationContext(depth);
+		const toolResultSection = formatToolResultContext(depth);
 		const lastRephraseSection = formatLastRephraseContext();
 
 		const sections = [
@@ -598,23 +782,20 @@ Rules:
 			timestamp: Date.now(),
 		};
 
-		try {
-			const response = await ctx.modelRegistry.complete(
-				model,
-				{ systemPrompt: REPHRASE_SYSTEM_PROMPT, messages: [userMsg] },
-				{ signal: ac.signal },
-			);
+		const response = await ctx.modelRegistry.complete(
+			model,
+			{ systemPrompt: REPHRASE_SYSTEM_PROMPT, messages: [userMsg] },
+			{ signal },
+		);
 
-			if (response.stopReason === "aborted") return null;
+		// Transient: throw so withRetry can retry.
+		if (signal.aborted) throw new Error("rephrase aborted");
+		if (response.stopReason === "aborted") throw new Error("rephrase aborted");
+		// Permanent: provider error or empty response.
+		if (response.stopReason === "error") return null;
 
-			const text = extractText(response);
-			return text.length > 0 ? text : null;
-		} catch {
-			return null;
-		} finally {
-			clearTimeout(timer);
-			unlinkUser();
-		}
+		const text = extractText(response);
+		return text.length > 0 ? text : null;
 	}
 
 	// ── Input handler — gates, interrupt, env config, flow ──────
@@ -654,35 +835,106 @@ Rules:
 			1,
 			Math.min(timeoutMs, configuredSelectionTimeout),
 		);
+		const maxRetries =
+			process.env.PI_REPHRASE_MAX_RETRIES !== undefined &&
+			process.env.PI_REPHRASE_MAX_RETRIES !== ""
+				? Math.max(0, Number(process.env.PI_REPHRASE_MAX_RETRIES) || 0)
+				: DEFAULT_MAX_RETRIES;
+		const retryBaseMs =
+			process.env.PI_REPHRASE_RETRY_BASE_MS !== undefined &&
+			process.env.PI_REPHRASE_RETRY_BASE_MS !== ""
+				? Math.max(1, Number(process.env.PI_REPHRASE_RETRY_BASE_MS) || DEFAULT_RETRY_BASE_MS)
+				: DEFAULT_RETRY_BASE_MS;
+		const debug = process.env.PI_REPHRASE_DEBUG === "1";
 
-		// Interrupt check before the selector LLM call.
+		// Interrupt check before any LLM call.
 		if (userSignal?.aborted) {
 			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
 			return { action: "continue" };
 		}
 
-		// Selector.
+		// Classifier + selector run in parallel on the active model
+		// (ctx.model). Each goes through withRetry: bounded exponential
+		// backoff with jitter, per-attempt timeout = selectionTimeoutMs /
+		// classifierTimeoutMs, total budget capped by userSignal.
 		const candidates = discoverContextCandidates(c.cwd);
-		const selectedFiles = await selectContextFiles(
-			c.modelRegistry,
-			model,
-			c.cwd,
-			event.text,
-			candidates,
-			selectionTimeoutMs,
-			userSignal,
+		const classifierTimeoutMs = Math.max(
+			1,
+			Math.min(timeoutMs, MAX_CLASSIFIER_TIMEOUT_MS),
+		);
+		const [selectedFilesResult, classifierResult] = await Promise.all([
+			withRetry(
+				(signal) =>
+					selectContextFiles(
+						c.modelRegistry,
+						model,
+						c.cwd,
+						event.text,
+						candidates,
+						signal,
+					),
+				{
+					maxRetries,
+					baseMs: retryBaseMs,
+					timeoutMs: selectionTimeoutMs,
+					signal: userSignal,
+					label: "selector",
+					debug,
+				},
+			),
+			withRetry(
+				(signal) =>
+					classifyFollowUpNeeded(
+						c.modelRegistry,
+						model,
+						event.text,
+						conversationBuffer,
+						signal,
+					),
+				{
+					maxRetries,
+					baseMs: retryBaseMs,
+					timeoutMs: classifierTimeoutMs,
+					signal: userSignal,
+					label: "classifier",
+					debug,
+				},
+			),
+		]);
+		const selectedFiles = selectedFilesResult ?? [];
+
+		// Interrupt check after parallel work, before rephrase.
+		if (userSignal?.aborted) {
+			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
+			return { action: "continue" };
+		}
+
+		// Decide history depth: classifier wins; on failure, regex
+		// fallback maps match/no-match to light/heavy/none.
+		const regexMatched = FALLBACK_FOLLOW_UP_SIGNAL.test(event.text);
+		const depth = pickHistoryDepth(
+			classifierResult,
+			conversationBuffer.length,
+			regexMatched,
 		);
 
-		// Interrupt check before the rephrase LLM call.
-		if (userSignal?.aborted) {
-			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
-			return { action: "continue" };
-		}
-
-		// Load context, then rephrase.
+		// Load context, then rephrase through withRetry. On retry exhaustion
+		// rephrase returns null, which falls back to passing the original
+		// input through unchanged (current contract).
 		const projectCtx = loadContext(c.cwd, maxTotal, selectedFiles);
 		const repoName = basename(c.cwd);
-		const rephrased = await rephrase(c, event.text, projectCtx, repoName, userSignal, timeoutMs);
+		const rephrased = await withRetry(
+			(signal) =>
+				rephrase(c, event.text, projectCtx, repoName, signal, depth),
+			{
+				maxRetries,
+				baseMs: retryBaseMs,
+				timeoutMs,
+				signal: userSignal,
+				label: "rephrase",
+				debug,
+			},
+		);
 
 		if (!rephrased) {
 			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
