@@ -13,6 +13,8 @@
  *   PI_REPHRASE_TIMEOUT_MS="8000"        # default = 8000
  *   PI_REPHRASE_MAX_CONTEXT_CHARS="6000" # default = 6000
  *   PI_REPHRASE_SELECTION_TIMEOUT_MS="2500" # optional selector timeout
+ *   PI_REPHRASE_MAX_RETRIES="2"          # default = 2 (0 disables retries)
+ *   PI_REPHRASE_RETRY_BASE_MS="500"      # default = 500
  *   PI_REPHRASE_OFF="1"                  # kill switch, passthrough
  *   PI_REPHRASE_DEBUG="1"                # log rephrased text to stderr
  *
@@ -85,9 +87,7 @@ const MAX_CONVERSATION_TURNS = 6;
 const MAX_TOOL_RESULT_SNAPSHOTS = 3;
 const MAX_CONVERSATION_CHARS = 2000;
 const MAX_TOOL_RESULT_CHARS = 1000;
-const MAX_REPHRASE_HISTORY = 1;
 const LIGHT_HISTORY_TURNS = 2;
-const MAX_CLASSIFIER_CACHE_ENTRIES = 16;
 const CLASSIFIER_TURNS_TO_CONSIDER = 3;
 
 const FOLLOW_UP_CLASSIFIER_SYSTEM_PROMPT = `Decide whether the user's latest message depends on prior conversation context.
@@ -110,13 +110,12 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	// ── Rolling buffers for session-aware rephrasing ────────────
 	const conversationBuffer: ConversationTurn[] = [];
 	const toolResultBuffer: ToolResultSnapshot[] = [];
-	const rephraseHistory: string[] = [];
-	const followUpCache = new Map<string, boolean>();
-
-	function rememberRephrase(text: string): void {
-		rephraseHistory.push(text);
-		if (rephraseHistory.length > MAX_REPHRASE_HISTORY) rephraseHistory.shift();
-	}
+	// Map from transformed user-message timestamp → original text. Used
+	// to recover the original wording from `message_end` after our own
+	// transform rewrote it. Without this, the buffer captures our
+	// rephrased output and feeds it back on the next turn, compounding
+	// verbosity and drifting from user voice across a session.
+	const originalsByTimestamp = new Map<number, string>();
 
 	function recordTurn(role: "user" | "assistant", text: string): void {
 		const trimmed = text.trim();
@@ -169,26 +168,27 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		return joined.slice(overflow);
 	}
 
-	function formatLastRephraseContext(): string {
-		if (rephraseHistory.length === 0) return "";
-		const last = rephraseHistory[rephraseHistory.length - 1];
-		return `Previous rephrase of similar intent:\n${last}`;
-	}
+	// Prior rephrases used to be injected into the next rephrase as a
+	// "Previous rephrase of similar intent" section. Removed: doing so
+	// creates a feedback loop where each rephrase is conditioned on the
+	// previous one, drifting from the user's voice across turns. The
+	// conversation buffer already provides prior-turn grounding when
+	// the classifier says follow-up.
 
 	function extractAssistantText(message: unknown): string {
 		if (!message || typeof message !== "object") return "";
-		const m = message as { content?: unknown; text?: unknown };
-		if (typeof m.text === "string") return m.text;
-		if (Array.isArray(m.content)) {
-			const parts: string[] = [];
-			for (const part of m.content) {
-				if (part && typeof part === "object" && "text" in part && typeof (part as { text: unknown }).text === "string") {
-					parts.push((part as { text: string }).text);
-				}
+		const m = message as { content?: unknown };
+		// AssistantMessage.content is typed as an array of text/thinking/tool
+		// blocks. A top-level `text` field never appears on assistant
+		// messages — the array path is the only real path.
+		if (!Array.isArray(m.content)) return "";
+		const parts: string[] = [];
+		for (const part of m.content) {
+			if (part && typeof part === "object" && "text" in part && typeof (part as { text: unknown }).text === "string") {
+				parts.push((part as { text: string }).text);
 			}
-			return parts.join("\n");
 		}
-		return "";
+		return parts.join("\n");
 	}
 
 	function extractToolResultText(toolResult: unknown): string {
@@ -212,48 +212,57 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	pi.on("session_start", () => {
 		conversationBuffer.length = 0;
 		toolResultBuffer.length = 0;
-		rephraseHistory.length = 0;
-		followUpCache.clear();
+		originalsByTimestamp.clear();
 	});
 
-	// turn_end: capture the assistant message and tool results from
-	// the just-completed turn so the next input has them in context.
-	pi.on("turn_end", (event) => {
-		const e = event as { message?: unknown; toolResults?: unknown[] };
-		const assistantText = extractAssistantText(e.message);
-		if (assistantText) recordTurn("assistant", assistantText);
-		if (Array.isArray(e.toolResults)) {
-			for (const tr of e.toolResults) {
-				const toolName =
-					tr && typeof tr === "object" && typeof (tr as { toolName?: unknown }).toolName === "string"
-						? (tr as { toolName: string }).toolName
-						: "tool";
-				recordToolResult(toolName, extractToolResultText(tr));
-			}
-		}
-	});
-
-	// message_end: catch user messages too (they don't appear in turn_end).
+	// message_end is the single capture point for both user and assistant
+	// messages plus tool results. We do NOT subscribe to turn_end because
+	// message_end fires for both message types and avoids the parallel
+	// capture path that previously let the buffer accumulate rephrased
+	// text alongside original text.
 	pi.on("message_end", (event) => {
 		const e = event as { message?: unknown };
-		const m = e.message as { role?: unknown; text?: unknown; content?: unknown } | undefined;
-		if (!m || m.role !== "user") return;
-		const text =
-			typeof m.text === "string"
-				? m.text
-				: Array.isArray(m.content)
-					? m.content
-							.filter(
-								(part): part is { text: string } =>
-									!!part &&
-									typeof part === "object" &&
-									"text" in part &&
-									typeof (part as { text: unknown }).text === "string",
-							)
-							.map((part) => part.text)
-							.join("\n")
-					: "";
-		recordTurn("user", text);
+		const m = e.message as { role?: unknown; timestamp?: unknown; content?: unknown } | undefined;
+		if (!m) return;
+
+		if (m.role === "assistant") {
+			const text = extractAssistantText(m);
+			if (text) recordTurn("assistant", text);
+			return;
+		}
+
+		if (m.role === "user") {
+			// Prefer the original text captured at input time (before our
+			// transform). Falls back to the message content if the input
+			// came from a path that didn't record originals (e.g. RPC).
+			const timestamp = typeof m.timestamp === "number" ? m.timestamp : undefined;
+			const original = timestamp !== undefined ? originalsByTimestamp.get(timestamp) : undefined;
+			if (original !== undefined) {
+				recordTurn("user", original);
+				if (timestamp !== undefined) originalsByTimestamp.delete(timestamp);
+				return;
+			}
+			const text = Array.isArray(m.content)
+				? m.content
+						.filter(
+							(part): part is { text: string } =>
+								!!part &&
+								typeof part === "object" &&
+								"text" in part &&
+								typeof (part as { text: unknown }).text === "string",
+						)
+						.map((part) => part.text)
+						.join("\n")
+				: "";
+			if (text) recordTurn("user", text);
+			return;
+		}
+
+		if (m.role === "toolResult") {
+			const tr = m as { toolName?: unknown; content?: unknown };
+			const toolName = typeof tr.toolName === "string" ? tr.toolName : "tool";
+			recordToolResult(toolName, extractToolResultText(tr));
+		}
 	});
 	// ── Configuration constants (closure-local) ────────────────
 	const MAX_FILE_CHARS = 1500;
@@ -286,28 +295,28 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 Rules:
 - Select only paths from the supplied candidate inventory.
 - Select at most ${MAX_SELECTED_CONTEXT_FILES} files most relevant to the user's request.
-- Prefer project instructions, architecture documentation, relevant source files, tests, and manifests.
-- Do not select secrets, credentials, generated output, dependency trees, or unrelated files.
+- Hard caps: at most 1 manifest file (e.g. package.json, Cargo.toml, pyproject.toml, go.mod); at most 1 instructions file (e.g. AGENTS.md, CLAUDE.md, README.md). The remaining slots go to source code.
+- Prefer source code that is actually relevant to the user's request over generic project boilerplate.
+- Do not select secrets, credentials, generated output, dependency trees, lockfiles, or unrelated files.
 - Return {"files":[]} when no candidate helps.
 - Never include explanations, Markdown fences, or paths not present in the inventory.`;
 
 	const REPHRASE_SYSTEM_PROMPT = `You are a request rephraser for a coding agent. Your only job: take the user's raw request and rewrite it as a clear, actionable prompt that another LLM can execute well.
 
-You may be given four context blocks before the user's request:
+You may be given three context blocks before the user's request:
 - "Recent conversation": prior turns in this session. Use to resolve pronouns, references like "fix that", and follow-ups that depend on earlier intent.
 - "Recent tool results": what the agent just did or tried. Use to know what state the project is in.
-- "Previous rephrase of similar intent": the last rephrased version of the same kind of request. Use to keep tone consistent and avoid parroting the same phrasing.
 - "Project files (selected by model)": file contents the model thinks are relevant to the current request.
 
-Rules:
-- Preserve user intent EXACTLY. Never add goals the user did not state. Never silently override the user's explicit choices.
-- If the user's request conflicts with project conventions from the context files (e.g. user says "use Express" but AGENTS.md forbids it), KEEP the user's choice and append a one-line note flagging the conflict so the downstream agent can confirm with the user. Do NOT silently rewrite to match conventions.
-- Resolve genuine ambiguity with the most reasonable interpretation; do NOT ask the user. Prefer acting over asking.
-- Inject relevant project context (stack, conventions, constraints) only when it helps the downstream agent pick the right approach.
-- If the request mentions a library, framework, SDK, or CLI, append a one-line reminder: "Refresh current docs via the find-docs skill before relying on API details."
-- Output ONE prompt, no preamble, no explanation, no "Here is the rephrased request:". No markdown fencing around the whole output.
-- Keep it concise. Do not pad. Do not moralize.
-- Use imperative voice ("Fix X", "Add Y", "Refactor Z to support W").`;
+Rules (in strict priority order):
+1. Preserve user intent EXACTLY. Never add goals, libraries, conventions, constraints, or requirements the user did not state.
+2. Do not append skill suggestions, documentation reminders, conflict notes, or any text not present in or directly implied by the user's input. Output ONLY the rephrased request.
+3. Resolve ambiguity only by choosing between interpretations of what the user said. Do not invent new requirements.
+4. Inject project context (stack, file structure, naming conventions) only when it helps clarify what the user already asked for, not when it would change the answer.
+5. If the user explicitly chose something that conflicts with a project convention in the context files, keep the user's choice.
+6. Output ONE prompt, no preamble, no explanation, no "Here is the rephrased request:". No markdown fencing around the whole output.
+7. Keep it concise. Do not pad. Do not moralize.
+8. Use imperative voice ("Fix X", "Add Y", "Refactor Z to support W").`;
 
 	// ── Path and file helpers ──────────────────────────────────
 
@@ -395,7 +404,9 @@ Rules:
 		const listedCandidates: ContextFileCandidate[] = [];
 		let total = 0;
 		for (const candidate of candidates) {
-			const line = `- ${candidate.path} (${candidate.size} bytes)`;
+			// No file sizes — large files bias the LLM toward big/boilerplate
+			// files (package.json, lockfiles) over the small relevant source.
+			const line = `- ${candidate.path}`;
 			if (total + line.length + 1 > DEFAULT_MAX_INVENTORY_CHARS) break;
 			lines.push(line);
 			listedCandidates.push(candidate);
@@ -622,27 +633,12 @@ Rules:
 		const lightOrHeavy = bufferLength <= LIGHT_HISTORY_TURNS + 1 ? "light" : "heavy";
 		if (classifierResult === true) return lightOrHeavy;
 		if (classifierResult === false) return "none";
+		// Classifier returned null (timeout/error with no retries left).
+		// On failure, the regex fallback is the only signal — match →
+		// include history, no match → omit. Never default to including on
+		// classifier failure, since the regex over-matches (e.g. "this is
+		// the second time today" matches `this`).
 		return regexMatched ? lightOrHeavy : "none";
-	}
-
-	function followUpCacheKey(
-		text: string,
-		conversation: readonly ConversationTurn[],
-	): string {
-		const trimmed = text.trim();
-		const recent = conversation.slice(-CLASSIFIER_TURNS_TO_CONSIDER);
-		return `${trimmed}\u241F${recent
-			.map((t) => `${t.role}:${t.text.slice(0, 200)}`)
-			.join("|")}`;
-	}
-
-	function cacheFollowUp(key: string, value: boolean): boolean {
-		if (followUpCache.size >= MAX_CLASSIFIER_CACHE_ENTRIES) {
-			const oldest = followUpCache.keys().next().value;
-			if (oldest !== undefined) followUpCache.delete(oldest);
-		}
-		followUpCache.set(key, value);
-		return value;
 	}
 
 	async function classifyFollowUpNeeded(
@@ -654,10 +650,6 @@ Rules:
 	): Promise<FollowUpResult> {
 		if (conversation.length === 0) return false;
 		if (!model || !modelRegistry.hasConfiguredAuth?.(model)) return null;
-
-		const key = followUpCacheKey(originalText, conversation);
-		const cached = followUpCache.get(key);
-		if (cached !== undefined) return cached;
 
 		const recent = conversation.slice(-CLASSIFIER_TURNS_TO_CONSIDER);
 		const formatted = recent
@@ -691,8 +683,8 @@ Rules:
 		if (response.stopReason === "error") return null;
 
 		const out = extractText(response).trim().toUpperCase();
-		if (out.startsWith("Y")) return cacheFollowUp(key, true);
-		if (out.startsWith("N")) return cacheFollowUp(key, false);
+		if (out.startsWith("Y")) return true;
+		if (out.startsWith("N")) return false;
 		return null;
 	}
 
@@ -756,13 +748,11 @@ Rules:
 
 		const conversationSection = formatConversationContext(depth);
 		const toolResultSection = formatToolResultContext(depth);
-		const lastRephraseSection = formatLastRephraseContext();
 
 		const sections = [
 			`Project: ${repoName} (cwd=${ctx.cwd})`,
 			conversationSection,
 			toolResultSection,
-			lastRephraseSection,
 			projectCtx
 				? `Project files (selected by model):\n${projectCtx}`
 				: "(no project files selected)",
@@ -806,24 +796,32 @@ Rules:
 		// Silent gates: short-circuit before any UI notification.
 		if (process.env.PI_REPHRASE_OFF === "1") return { action: "continue" };
 		if (event.source === "extension") return { action: "continue" };
+		if (event.source === "rpc") return { action: "continue" };
 		if (event.streamingBehavior === "steer") return { action: "continue" };
+		if (event.streamingBehavior === "followUp") return { action: "continue" };
+
+		// `@file` references — the `input` event sees the raw text BEFORE
+		// Pi resolves `@file` to file contents. Rephrasing here produces
+		// output that contains the unresolved `@src/foo.ts` literal AND
+		// files the selector guessed — internally inconsistent.
+		if (event.text.includes("@")) return { action: "continue" };
+
+		// Slash-command-shaped input — if no extension command matched,
+		// `/foo bar` reaches us as prose. Rephrasing it produces "Execute
+		// the foo command with the bar argument" which strips the user's
+		// leading `/` and invents intent.
+		if (event.text.startsWith("/")) return { action: "continue" };
+
+		// Empty / whitespace-only input — nothing to rephrase.
+		if (event.text.trim().length === 0) return { action: "continue" };
 
 		// User interrupt — honor before any work, including notify.
 		const userSignal = c.signal;
 		if (userSignal?.aborted) return { action: "continue" };
 
-		// Notify start (preserves byte-identical flow for cases below).
-		if (c.hasUI) c.ui!.notify("Rephrasing with context…", "info");
-
 		const model = c.model;
-		if (!model) {
-			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
-			return { action: "continue" };
-		}
-		if (!c.modelRegistry.hasConfiguredAuth?.(model)) {
-			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
-			return { action: "continue" };
-		}
+		if (!model) return { action: "continue" };
+		if (!c.modelRegistry.hasConfiguredAuth?.(model)) return { action: "continue" };
 
 		// Env config.
 		const maxTotal =
@@ -847,16 +845,19 @@ Rules:
 				: DEFAULT_RETRY_BASE_MS;
 		const debug = process.env.PI_REPHRASE_DEBUG === "1";
 
-		// Interrupt check before any LLM call.
-		if (userSignal?.aborted) {
-			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
-			return { action: "continue" };
-		}
+		// Capture original text so the buffer holds user wording, not our
+		// rephrase output, on subsequent turns. Timestamp is assigned when
+		// we return the transform — Pi records that same timestamp on the
+		// UserMessage. We approximate with Date.now() at capture time.
+		const capturedTimestamp = Date.now();
+		originalsByTimestamp.set(capturedTimestamp, event.text);
+
+		// Now we know we're going to do work — notify only then.
+		if (c.hasUI) c.ui!.notify("Rephrasing with context…", "info");
 
 		// Classifier + selector run in parallel on the active model
 		// (ctx.model). Each goes through withRetry: bounded exponential
-		// backoff with jitter, per-attempt timeout = selectionTimeoutMs /
-		// classifierTimeoutMs, total budget capped by userSignal.
+		// backoff with jitter, per-attempt timeout.
 		const candidates = discoverContextCandidates(c.cwd);
 		const classifierTimeoutMs = Math.max(
 			1,
@@ -903,12 +904,6 @@ Rules:
 		]);
 		const selectedFiles = selectedFilesResult ?? [];
 
-		// Interrupt check after parallel work, before rephrase.
-		if (userSignal?.aborted) {
-			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
-			return { action: "continue" };
-		}
-
 		// Decide history depth: classifier wins; on failure, regex
 		// fallback maps match/no-match to light/heavy/none.
 		const regexMatched = FALLBACK_FOLLOW_UP_SIGNAL.test(event.text);
@@ -937,19 +932,27 @@ Rules:
 		);
 
 		if (!rephrased) {
-			if (c.hasUI) c.ui!.notify("Rephrase skipped (timeout/error)", "info");
+			// Silent on benign skips — the start notification already told
+			// the user we were working. Debug log captures the failure for
+			// diagnosis. Don't train the user to ignore noisy notifications.
+			if (debug) {
+				process.stderr.write(
+					`[rephrase-skip] ${event.text.slice(0, 80)}\n`,
+				);
+			}
+			originalsByTimestamp.delete(capturedTimestamp);
 			return { action: "continue" };
 		}
-
-		rememberRephrase(rephrased);
 
 		if (c.hasUI)
 			c.ui!.notify(
 				`Rephrased via ${(model as { id?: string }).id ?? "model"}`,
 				"info",
 			);
-		if (process.env.PI_REPHRASE_DEBUG === "1") {
-			process.stderr.write(`\n===[REPHRASE]===\n${rephrased}\n===[END]===\n\n`);
+		if (debug) {
+			process.stderr.write(
+				`\n===[REPHRASE]===\n${rephrased}\n===[END]===\n\n`,
+			);
 		}
 		return { action: "transform", text: rephrased };
 	});

@@ -46,6 +46,35 @@ function clearEnv(): void {
 }
 
 /**
+ * Build a real-shaped Pi message payload (content array, not top-level
+ * text). Keeps tests aligned with what the actual `message_end` event
+ * delivers — using top-level `text` would mask the array-extraction path
+ * that runs in production.
+ */
+function userMsg(text: string, timestamp?: number): any {
+	return {
+		role: "user",
+		content: [{ type: "text", text }],
+		timestamp: timestamp ?? Date.now(),
+	};
+}
+function assistantMsg(text: string, timestamp?: number): any {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		timestamp: timestamp ?? Date.now(),
+	};
+}
+function toolResultMsg(toolName: string, text: string, timestamp?: number): any {
+	return {
+		role: "toolResult",
+		toolName,
+		content: [{ type: "text", text }],
+		timestamp: timestamp ?? Date.now(),
+	};
+}
+
+/**
  * Register a rephraseInput handler on a stub `pi` and return the captured
  * callback. Mirrors what the real Pi runtime does.
  */
@@ -64,19 +93,17 @@ function captureHandler(): {
 
 /**
  * Like `captureHandler`, but also captures the session-lifecycle handlers
- * (session_start, turn_end, message_end) so tests can drive the rolling
+ * (session_start, message_end) so tests can drive the rolling
  * context buffer.
  */
 function captureAllHandlers(): {
 	handler: (event: any, context: any) => Promise<unknown>;
 	fireSessionStart: () => void;
-	fireTurnEnd: (event: any) => void;
 	fireMessageEnd: (event: any) => void;
 } {
 	const captured: {
 		handler?: (event: any, context: any) => Promise<unknown>;
 		sessionStart?: () => void;
-		turnEnd?: (event: any) => void;
 		messageEnd?: (event: any) => void;
 	} = {};
 	rephraseInput({
@@ -84,10 +111,6 @@ function captureAllHandlers(): {
 			if (event === "session_start")
 				captured.sessionStart = () => {
 					(registered as () => unknown)();
-				};
-			else if (event === "turn_end")
-				captured.turnEnd = (e: any) => {
-					void (registered as (e: any) => Promise<unknown>)(e);
 				};
 			else if (event === "message_end")
 				captured.messageEnd = (e: any) => {
@@ -97,12 +120,11 @@ function captureAllHandlers(): {
 		},
 	} as any);
 	if (!captured.handler) throw new Error("input handler not registered");
-	if (!captured.sessionStart || !captured.turnEnd || !captured.messageEnd)
+	if (!captured.sessionStart || !captured.messageEnd)
 		throw new Error("lifecycle handlers not registered");
 	return {
 		handler: captured.handler,
 		fireSessionStart: captured.sessionStart,
-		fireTurnEnd: captured.turnEnd,
 		fireMessageEnd: captured.messageEnd,
 	};
 }
@@ -443,18 +465,14 @@ test("feeds recent conversation history into the rephrase prompt", async () => {
 				return { content: [{ type: "text", text: "Rephrased follow-up" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
 		// Simulate prior conversation: user said something, agent responded.
+		fireMessageEnd({ message: userMsg("explain how auth works in this app") });
 		fireMessageEnd({
-			message: { role: "user", text: "explain how auth works in this app" },
-		});
-		fireTurnEnd({
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "Auth uses JWT in src/auth.ts and refresh tokens in src/auth-refresh.ts." }],
-			},
-			toolResults: [],
+			message: assistantMsg(
+				"Auth uses JWT in src/auth.ts and refresh tokens in src/auth-refresh.ts.",
+			),
 		});
 
 		const result = await handler(
@@ -527,17 +545,15 @@ test("feeds recent tool results into the rephrase prompt", async () => {
 				return { content: [{ type: "text", text: "Rephrased with tool context" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
 		// Last turn ended with a bash tool result the agent saw.
-		fireTurnEnd({
-			message: { role: "assistant", content: [{ type: "text", text: "ran tests" }] },
-			toolResults: [
-				{
-					toolName: "bash",
-					content: [{ type: "text", text: "Tests failed: 2 of 5 in src/auth.test.ts" }],
-				},
-			],
+		fireMessageEnd({ message: assistantMsg("ran tests") });
+		fireMessageEnd({
+			message: toolResultMsg(
+				"bash",
+				"Tests failed: 2 of 5 in src/auth.test.ts",
+			),
 		});
 
 		await handler(
@@ -577,13 +593,10 @@ test("session_start resets the rolling buffer", async () => {
 				return { content: [{ type: "text", text: "Rephrased fresh" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
-		fireMessageEnd({ message: { role: "user", text: "stale turn" } });
-		fireTurnEnd({
-			message: { role: "assistant", content: [{ type: "text", text: "stale reply" }] },
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("stale turn") });
+		fireMessageEnd({ message: assistantMsg("stale reply") });
 
 		// New session — buffers wipe.
 		fireSessionStart();
@@ -613,7 +626,7 @@ test("session_start resets the rolling buffer", async () => {
 	}
 });
 
-test("prior rephrase is included on the next call to keep tone consistent", async () => {
+test("prior rephrase is NOT injected into the next rephrase (no feedback loop)", async () => {
 	clearEnv();
 	const cwd = makeProject({ "README.md": "context" });
 	try {
@@ -655,10 +668,16 @@ test("prior rephrase is included on the next call to keep tone consistent", asyn
 			},
 		);
 
-		// The second rephrase call sees the first rephrase.
+		// The second rephrase call must NOT see the first rephrase — that
+		// section was removed to prevent a feedback loop where each
+		// rephrase is conditioned on the previous one, drifting from user
+		// voice across a session.
 		const secondRephraseMsg = calls[3].context.messages[0].content[0].text;
-		assert.match(secondRephraseMsg, /Previous rephrase of similar intent:/);
-		assert.match(secondRephraseMsg, /Rephrased again/);
+		assert.doesNotMatch(
+			secondRephraseMsg,
+			/Previous rephrase of similar intent:/,
+		);
+		assert.doesNotMatch(secondRephraseMsg, /Rephrased again/);
 	} finally {
 		cleanup(cwd);
 	}
@@ -687,13 +706,10 @@ test("classifier says NO → omits conversation section even with prior turns", 
 				return { content: [{ type: "text", text: "Rephrased fresh" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
-		fireMessageEnd({ message: { role: "user", text: "earlier question" } });
-		fireTurnEnd({
-			message: { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("earlier question") });
+		fireMessageEnd({ message: assistantMsg("earlier answer") });
 
 		const result = await handler(
 			{ source: "interactive", text: "add a new login button" },
@@ -746,25 +762,13 @@ test("classifier says YES with small buffer → includes only recent turns (ligh
 				return { content: [{ type: "text", text: "Rephrased follow-up" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
 		// Buffer has 2 turns — within light range (<= LIGHT_HISTORY_TURNS + 1 = 3).
-		fireMessageEnd({ message: { role: "user", text: "what about the old auth flow" } });
-		fireTurnEnd({
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "old flow uses sessions" }],
-			},
-			toolResults: [],
-		});
-		fireMessageEnd({ message: { role: "user", text: "ok and the new one" } });
-		fireTurnEnd({
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "new flow uses tokens" }],
-			},
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("what about the old auth flow") });
+		fireMessageEnd({ message: assistantMsg("old flow uses sessions") });
+		fireMessageEnd({ message: userMsg("ok and the new one") });
+		fireMessageEnd({ message: assistantMsg("new flow uses tokens") });
 
 		await handler(
 			{ source: "interactive", text: "fix it" },
@@ -810,16 +814,10 @@ test("classifier throws → falls back to regex match → includes history", asy
 				return { content: [{ type: "text", text: "Rephrased fallback" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
-		fireMessageEnd({ message: { role: "user", text: "earlier user message" } });
-		fireTurnEnd({
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "earlier reply" }],
-			},
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("earlier user message") });
+		fireMessageEnd({ message: assistantMsg("earlier reply") });
 
 		const result = await handler(
 			// Regex matches: "fix that" → include history via fallback.
@@ -866,16 +864,10 @@ test("classifier aborts and regex misses → omits conversation", async () => {
 				return { content: [{ type: "text", text: "Rephrased clean" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
-		fireMessageEnd({ message: { role: "user", text: "prior turn" } });
-		fireTurnEnd({
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "prior reply" }],
-			},
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("prior turn") });
+		fireMessageEnd({ message: assistantMsg("prior reply") });
 
 		const result = await handler(
 			// Input is self-contained, no follow-up signal.
@@ -898,7 +890,7 @@ test("classifier aborts and regex misses → omits conversation", async () => {
 	}
 });
 
-test("classifier caches result across identical input + buffer snapshot", async () => {
+test("classifier is invoked on every input — no broken cache", async () => {
 	clearEnv();
 	const cwd = makeProject({ "README.md": "context" });
 	try {
@@ -911,24 +903,20 @@ test("classifier caches result across identical input + buffer snapshot", async 
 				options?: Call["options"],
 			): Promise<Completion> => {
 				calls.push({ model: undefined, context, options });
-				if (calls.length === 1 || calls.length === 3) {
+				if (calls.length === 1 || calls.length === 3 || calls.length === 5) {
 					return { content: [{ type: "text", text: '{"files":[]}' }] };
 				}
-				if (calls.length === 2) {
-					// Classifier invoked once and cached.
+				if (calls.length === 2 || calls.length === 4) {
+					// Classifier invoked once per input (cache was removed).
 					return { content: [{ type: "text", text: "YES" }] };
 				}
-				// calls.length === 4: second rephrase.
 				return { content: [{ type: "text", text: "Rephrased again" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
-		fireMessageEnd({ message: { role: "user", text: "shared turn" } });
-		fireTurnEnd({
-			message: { role: "assistant", content: [{ type: "text", text: "shared reply" }] },
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("shared turn") });
+		fireMessageEnd({ message: assistantMsg("shared reply") });
 
 		// First invocation: selector (1), classifier (2), rephrase (3).
 		await handler(
@@ -941,9 +929,9 @@ test("classifier caches result across identical input + buffer snapshot", async 
 			},
 		);
 
-		// Second invocation with same input + same buffer snapshot.
-		// Buffer unchanged between calls (handler does not record its own
-		// input), so the cache key matches → classifier not called.
+		// Second invocation: classifier is invoked again — the old cache
+		// (keyed on input text + buffer snapshot) almost never hit in
+		// normal use because each input changes the buffer or the text.
 		await handler(
 			{ source: "interactive", text: "fix that" },
 			{
@@ -954,10 +942,8 @@ test("classifier caches result across identical input + buffer snapshot", async 
 			},
 		);
 
-		// 1 (sel) + 1 (clf) + 1 (rephrase) + 1 (sel) + 0 (cache hit) + 1 (rephrase) = 5.
-		assert.equal(calls.length, 5);
-		const secondRephraseMsg = calls[4].context.messages[0].content[0].text;
-		assert.match(secondRephraseMsg, /Recent conversation/);
+		// 1 (sel) + 1 (clf) + 1 (rephrase) + 1 (sel) + 1 (clf) + 1 (rephrase) = 6.
+		assert.equal(calls.length, 6);
 	} finally {
 		cleanup(cwd);
 	}
@@ -1254,18 +1240,10 @@ test("classifier retries on transient failure and succeeds", async () => {
 				return { content: [{ type: "text", text: "Rephrased with history" }] };
 			},
 		};
-		const { handler, fireSessionStart, fireMessageEnd, fireTurnEnd } = captureAllHandlers();
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
 		fireSessionStart();
-		fireMessageEnd({
-			message: { role: "user", text: "previous user message" },
-		});
-		fireTurnEnd({
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "previous reply" }],
-			},
-			toolResults: [],
-		});
+		fireMessageEnd({ message: userMsg("previous user message") });
+		fireMessageEnd({ message: assistantMsg("previous reply") });
 
 		const result = await handler(
 			{ source: "interactive", text: "fix that" },
@@ -1285,6 +1263,631 @@ test("classifier retries on transient failure and succeeds", async () => {
 		const rephraseMsg = calls[3].context.messages[0].content[0].text;
 		assert.match(rephraseMsg, /Recent conversation \(oldest first\):/);
 		assert.match(rephraseMsg, /previous user message/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// P0 correctness regressions — high-severity failure modes
+// ──────────────────────────────────────────────────────────────────────
+
+test("buffer holds original user text after transform, not rephrased text (real Pi shape)", async () => {
+	clearEnv();
+	const cwd = makeProject({ "README.md": "context" });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_m: unknown, context: unknown) => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				if (calls.length === 2) return { content: [{ type: "text", text: "VERBOSE_REPHRASE_OF_ORIGINAL" }] };
+				if (calls.length === 3) return { content: [{ type: "text", text: "YES" }] }; // classifier
+				return { content: [{ type: "text", text: "second" }] };
+			},
+		};
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
+		fireSessionStart();
+
+		// Pin a timestamp the extension will use as both its captured
+		// timestamp (Date.now() at input time) and as the user-message
+		// timestamp on message_end. Real Pi would assign the timestamp
+		// at the same `prompt()` boundary.
+		const pinnedTs = Date.now();
+
+		// First input: original is short, terse.
+		await handler(
+			{ source: "interactive", text: "fix the auth bug" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+
+		// Real Pi flow: message_end fires for the user message with the
+		// rephrased text in `content`. The extension's timestamp capture
+		// happened within the same millisecond, so it must look up the
+		// original via the originalsByTimestamp map and ignore the
+		// rephrased content.
+		fireMessageEnd({
+			message: userMsg("VERBOSE_REPHRASE_OF_ORIGINAL", pinnedTs),
+		});
+
+		// Second input. Buffer should hold the original.
+		await handler(
+			{ source: "interactive", text: "and the test too" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+
+		const secondRephrase = calls[4].context.messages[0].content[0].text;
+		assert.match(secondRephrase, /U: fix the auth bug/);
+		assert.doesNotMatch(secondRephrase, /U: VERBOSE_REPHRASE_OF_ORIGINAL/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("@file references short-circuit before any LLM call", async () => {
+	clearEnv();
+	const cwd = makeProject({ "src/foo.ts": "content" });
+	try {
+		let calls = 0;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				calls++;
+				return { content: [{ type: "text", text: "should not run" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "explain @src/foo.ts" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		assert.deepEqual(result, { action: "continue" });
+		assert.equal(calls, 0, "@file short-circuit must skip all LLM calls");
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("/cmd-like text short-circuits before any LLM call", async () => {
+	clearEnv();
+	const cwd = makeProject({ "src/foo.ts": "content" });
+	try {
+		let calls = 0;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				calls++;
+				return { content: [{ type: "text", text: "x" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "/foo bar" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		assert.deepEqual(result, { action: "continue" });
+		assert.equal(calls, 0);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("source: rpc short-circuits without LLM calls", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let calls = 0;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				calls++;
+				return { content: [{ type: "text", text: "x" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "rpc", text: "build and test the project" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		assert.deepEqual(result, { action: "continue" });
+		assert.equal(calls, 0);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("streamingBehavior: followUp short-circuits without LLM calls", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let calls = 0;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				calls++;
+				return { content: [{ type: "text", text: "x" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", streamingBehavior: "followUp", text: "and also do X" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		assert.deepEqual(result, { action: "continue" });
+		assert.equal(calls, 0);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("empty / whitespace-only input short-circuits without LLM calls", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let calls = 0;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				calls++;
+				return { content: [{ type: "text", text: "x" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		for (const text of ["", "   ", "\n\n", "\t"]) {
+			const result = await handler(
+				{ source: "interactive", text },
+				{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+			);
+			assert.deepEqual(result, { action: "continue" }, `text=${JSON.stringify(text)}`);
+		}
+		assert.equal(calls, 0);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("notification ordering: no Rephrasing… when model is absent", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const messages: string[] = [];
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "do thing" },
+			{
+				model: undefined,
+				modelRegistry: {
+					hasConfiguredAuth: () => false,
+					complete: async () => ({ content: [{ type: "text", text: "x" }] }),
+				},
+				cwd,
+				hasUI: true,
+				ui: { notify: (m: string) => messages.push(m) },
+			},
+		);
+		assert.equal(messages.length, 0, "no notification when there is no model");
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("notification ordering: no Rephrase skipped on benign selector-empty", async () => {
+	clearEnv();
+	const cwd = makeProject({ "README.md": "x" });
+	try {
+		const messages: string[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			// Selector returns empty; rephrase still runs successfully.
+			complete: async () => ({ content: [{ type: "text", text: '{"files":[]}' }] }),
+		};
+		const { handler } = captureAllHandlers();
+		// First call: selector (empty). Second: rephrase (succeeds).
+		let n = 0;
+		const r2 = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				n++;
+				if (n === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		await handler(
+			{ source: "interactive", text: "do thing" },
+			{
+				model: { id: "m" },
+				modelRegistry: r2,
+				cwd,
+				hasUI: true,
+				ui: { notify: (m: string) => messages.push(m) },
+			},
+		);
+		assert.ok(messages.some((m) => m.startsWith("Rephrasing")), "Rephrasing… fires");
+		assert.ok(
+			!messages.some((m) => m.toLowerCase().includes("skipped")),
+			"no skipped notification for benign selector-empty",
+		);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("empty cwd does not crash and falls back to no-context rephrase", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_m: unknown, context: unknown) => {
+				calls.push({ model: undefined, context, options: undefined });
+				// Empty inventory in selector means no LLM call there —
+				// rephrase is the only call.
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "do thing" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		assert.deepEqual(result, { action: "transform", text: "Rephrased" });
+		// Only one LLM call: the rephrase. The selector was short-circuited.
+		assert.equal(calls.length, 1);
+		const rephraseMsg = calls[0].context.messages[0].content[0].text;
+		assert.match(rephraseMsg, /\(no project files selected\)/);
+		assert.match(rephraseMsg, /do thing/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("huge file (within size cap) is truncated to MAX_FILE_CHARS in rephrase context", async () => {
+	clearEnv();
+	const bigContent = "x".repeat(50_000); // 50KB, well under 200KB cap
+	const cwd = makeProject({ "src/big.ts": bigContent });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_m: unknown, context: unknown) => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) {
+					return { content: [{ type: "text", text: '{"files":["src/big.ts"]}' }] };
+				}
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "review big file" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		const rephraseMsg = calls[1].context.messages[0].content[0].text;
+		assert.match(rephraseMsg, /### src\/big\.ts/);
+		assert.match(rephraseMsg, /…\[truncated\]/);
+		// Block size: header + truncated body. Must be well under 50k chars.
+		assert.ok(rephraseMsg.length < 5_000, "truncated block is small");
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("real Pi message shape is captured into the buffer (array-form content)", async () => {
+	clearEnv();
+	const cwd = makeProject({ "README.md": "x" });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_m: unknown, context: unknown) => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				if (calls.length === 2) return { content: [{ type: "text", text: "YES" }] }; // classifier
+				return { content: [{ type: "text", text: "r" }] };
+			},
+		};
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
+		fireSessionStart();
+		fireMessageEnd({
+			message: userMsg("real-shape user text"),
+		});
+		await handler(
+			{ source: "interactive", text: "next" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		const rephraseMsg = calls[2].context.messages[0].content[0].text;
+		assert.match(rephraseMsg, /U: real-shape user text/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("selector prompt forbids adding unrequested context (no find-docs reminder)", async () => {
+	clearEnv();
+	const cwd = makeProject({ "README.md": "context" });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (
+				_m: unknown,
+				context: unknown,
+				_options?: Call["options"],
+			): Promise<Completion> => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "build a thing with express" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		// Rephrase system prompt must NOT inject the `find-docs` reminder.
+		const rephrasePrompt = calls[1].context.systemPrompt;
+		assert.doesNotMatch(rephrasePrompt, /Refresh current docs/i);
+		// And must not ask the model to flag AGENTS.md conflicts unilaterally.
+		assert.doesNotMatch(rephrasePrompt, /append a one-line note flagging the conflict/i);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("selector prompt has hard caps on manifests and instructions files", async () => {
+	clearEnv();
+	const cwd = makeProject({ "README.md": "context" });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (
+				_m: unknown,
+				context: unknown,
+				_options?: Call["options"],
+			): Promise<Completion> => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "review the auth flow" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		const selectorPrompt = calls[0].context.systemPrompt;
+		assert.match(selectorPrompt, /at most 1 manifest/i);
+		assert.match(selectorPrompt, /at most 1 instructions/i);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("inventory lines do not include file sizes (avoid big-file bias)", async () => {
+	clearEnv();
+	const cwd = makeProject({
+		"small.ts": "tiny",
+		"src/big.ts": "x".repeat(20_000),
+		"package.json": "{}",
+		"README.md": "readme",
+		"AGENTS.md": "agents",
+	});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (
+				_m: unknown,
+				context: unknown,
+				_options?: Call["options"],
+			): Promise<Completion> => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "review" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		const inventoryText = calls[0].context.messages[0].content[0].text;
+		assert.match(inventoryText, /- src\/big\.ts/);
+		assert.doesNotMatch(inventoryText, /bytes/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("rephrase fails (timeout) → debug log emitted, no skipped notification", async () => {
+	clearEnv();
+	process.env.PI_REPHRASE_DEBUG = "1";
+	process.env.PI_REPHRASE_MAX_RETRIES = "0";
+	const cwd = makeProject({ "README.md": "context" });
+	try {
+		const writes: string[] = [];
+		const origWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+			return true;
+		}) as typeof process.stderr.write;
+		const messages: string[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				throw new Error("rephrase down");
+			},
+		};
+		try {
+			const { handler } = captureHandler();
+			const result = await handler(
+				{ source: "interactive", text: "do thing" },
+				{
+					model: { id: "m" },
+					modelRegistry: registry,
+					cwd,
+					hasUI: true,
+					ui: { notify: (m: string) => messages.push(m) },
+				},
+			);
+			assert.deepEqual(result, { action: "continue" });
+			// Rephrasing… fires (we got past the gates), but no "skipped".
+			assert.ok(messages.some((m) => m.startsWith("Rephrasing")));
+			assert.ok(!messages.some((m) => m.toLowerCase().includes("skipped")));
+			// Debug log captures the failure.
+			assert.ok(writes.some((w) => w.includes("[rephrase-skip]")));
+		} finally {
+			process.stderr.write = origWrite;
+		}
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("huge repo (many candidate files) caps at MAX_CONTEXT_CANDIDATES without crash", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		// Create > 500 files to trigger the cap.
+		const files: Record<string, string> = {};
+		for (let i = 0; i < 600; i++) {
+			files[`src/file-${i.toString().padStart(4, "0")}.ts`] = `export const v${i} = ${i};`;
+		}
+		for (const [p, c] of Object.entries(files)) {
+			const path = join(cwd, p);
+			const parent = path.slice(0, path.lastIndexOf("/"));
+			mkdirSync(parent, { recursive: true });
+			writeFileSync(path, c);
+		}
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: "Rephrased" }] }),
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "review the project" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		assert.deepEqual(result, { action: "transform", text: "Rephrased" });
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("sensitive filenames are excluded from inventory and from any loaded context", async () => {
+	clearEnv();
+	const cwd = makeProject({
+		"src/feature.ts": "feature content",
+		".env": "SECRET=do-not-read",
+		"auth.json": '{"api_key":"abc"}',
+		"private-key.pem": "-----BEGIN PRIVATE KEY-----",
+	});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (
+				_m: unknown,
+				context: unknown,
+				_options?: Call["options"],
+			): Promise<Completion> => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) {
+					// Try to load sensitive files — must be filtered out.
+					return {
+						content: [
+							{
+								type: "text",
+								text: '{"files":["src/feature.ts",".env","auth.json","private-key.pem"]}',
+							},
+						],
+					};
+				}
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "review" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		// Selector inventory must not list sensitive files.
+		const inv = calls[0].context.messages[0].content[0].text;
+		assert.doesNotMatch(inv, /\.env\b/);
+		assert.doesNotMatch(inv, /auth\.json/);
+		assert.doesNotMatch(inv, /private-key/);
+		// Rephrase context must not include sensitive content even if
+		// the selector (wrongly) tried to pick them.
+		const rephrase = calls[1].context.messages[0].content[0].text;
+		assert.match(rephrase, /### src\/feature\.ts/);
+		assert.doesNotMatch(rephrase, /SECRET=do-not-read/);
+		assert.doesNotMatch(rephrase, /api_key/);
+		assert.doesNotMatch(rephrase, /BEGIN PRIVATE KEY/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("binary files are excluded from the selector inventory", async () => {
+	clearEnv();
+	const cwd = makeProject({
+		"src/feature.ts": "feature",
+		"image.png": new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]),
+		"binary.dat": new Uint8Array([0, 1, 2, 3]),
+	});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (
+				_m: unknown,
+				context: unknown,
+				_options?: Call["options"],
+			): Promise<Completion> => {
+				calls.push({ model: undefined, context, options: undefined });
+				if (calls.length === 1) return { content: [{ type: "text", text: '{"files":[]}' }] };
+				return { content: [{ type: "text", text: "Rephrased" }] };
+			},
+		};
+		const { handler } = captureHandler();
+		await handler(
+			{ source: "interactive", text: "review" },
+			{ model: { id: "m" }, modelRegistry: registry, cwd, hasUI: false },
+		);
+		const inv = calls[0].context.messages[0].content[0].text;
+		assert.match(inv, /src\/feature\.ts/);
+		assert.doesNotMatch(inv, /image\.png/);
+		assert.doesNotMatch(inv, /binary\.dat/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("PI_REPHRASE_OFF short-circuits BEFORE the model/auth check", async () => {
+	clearEnv();
+	process.env.PI_REPHRASE_OFF = "1";
+	const cwd = makeProject({});
+	try {
+		let notified = 0;
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "@file /cmd whatever" },
+			{
+				model: undefined,
+				modelRegistry: {
+					hasConfiguredAuth: () => false,
+					complete: async () => ({ content: [{ type: "text", text: "x" }] }),
+				},
+				cwd,
+				hasUI: true,
+				ui: { notify: () => notified++ },
+			},
+		);
+		assert.deepEqual(result, { action: "continue" });
+		assert.equal(notified, 0);
 	} finally {
 		cleanup(cwd);
 	}

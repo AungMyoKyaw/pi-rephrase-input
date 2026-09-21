@@ -40,14 +40,31 @@ pi -p "Explain the next change in this project"
 
 Selector failures produce an empty project context and do not block the existing rephrase flow. Rephrase failures pass the original input through unchanged.
 
+## What gets skipped
+
+The extension short-circuits (passes input through unchanged) for any of these:
+
+- `PI_REPHRASE_OFF=1` (kill switch).
+- `event.source === "extension"` (messages from `sendUserMessage` / other extensions).
+- `event.source === "rpc"` (RPC clients typically manage their own context).
+- `event.streamingBehavior === "steer"` or `"followUp"` (mid-stream redirects and queued follow-ups — by the time a follow-up is delivered, the agent already has the conversation context).
+- Input containing `@` (`@file` references — Pi resolves them after `input`, so the rephraser would produce internally inconsistent output).
+- Input starting with `/` (slash commands — if no extension command matched, the rephraser would strip the leading `/` and invent intent).
+- Empty / whitespace-only input.
+- No model selected, or no auth configured for the active model.
+
+The conversation buffer holds **original** user wording, not rephrased output, so each turn conditions on what the user actually said.
+
 ## Configuration
 
 ```bash
-PI_REPHRASE_TIMEOUT_MS=8000
-PI_REPHRASE_MAX_CONTEXT_CHARS=6000
-PI_REPHRASE_SELECTION_TIMEOUT_MS=2500
-PI_REPHRASE_OFF=1
-PI_REPHRASE_DEBUG=1
+PI_REPHRASE_TIMEOUT_MS=8000             # per-attempt wall-clock cap (default 8000)
+PI_REPHRASE_MAX_CONTEXT_CHARS=6000      # total chars of selected file content (default 6000)
+PI_REPHRASE_SELECTION_TIMEOUT_MS=2500   # per-attempt cap on selector + classifier (default timeout/3)
+PI_REPHRASE_MAX_RETRIES=2               # retries on transient LLM errors (default 2, 0 disables)
+PI_REPHRASE_RETRY_BASE_MS=500           # exponential backoff base (default 500)
+PI_REPHRASE_OFF=1                       # kill switch — passes everything through
+PI_REPHRASE_DEBUG=1                     # log retries + rephrase failures to stderr
 ```
 
 ## Development
