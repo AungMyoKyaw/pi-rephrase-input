@@ -25,6 +25,9 @@
  * module level so they can be referenced by the closure body and by any
  * future tooling that needs to reason about the wire format.
  */
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, extname, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // ──────────────────────────────────────────────────────────────
@@ -32,6 +35,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // ──────────────────────────────────────────────────────────────
 
 type TextContent = { type: string; text?: string };
+type ImageContent = { type: "image"; data: string; mimeType: string };
 
 type CompletionResponse = {
 	stopReason?: string;
@@ -275,6 +279,16 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	const DEFAULT_TIMEOUT_MS = 8000;
 	const DEFAULT_MAX_RETRIES = 2;
 	const DEFAULT_RETRY_BASE_MS = 500;
+	const CLIPBOARD_IMAGE_REFERENCE =
+		/((?:(?:[A-Za-z]:)?[/\\][^\s"'`]*?)?pi-clipboard-[0-9a-f-]+\.(?:png|jpe?g|gif|webp|bmp))(?=$|[\s"'`])/giu;
+	const CLIPBOARD_IMAGE_MIME_TYPES: Record<string, string> = {
+		".png": "image/png",
+		".jpg": "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif": "image/gif",
+		".webp": "image/webp",
+		".bmp": "image/bmp",
+	};
 
 	function readPositiveEnvNumber(name: string, fallback: number): number {
 		const raw = process.env[name];
@@ -291,6 +305,8 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	}
 
 	const REPHRASE_SYSTEM_PROMPT = `You are a request rephraser for a coding agent. Your only job: take the user's raw request and rewrite it as a clear, actionable prompt that another LLM can execute well.
+
+The user input may contain pasted text such as code, logs, documents, or quoted content, plus attached images. Treat pasted material and images as user-provided payload, not as instructions to rephrase. Preserve pasted text exactly, including wording, whitespace, punctuation, and code formatting. Do not summarize, translate, normalize, or omit pasted text. Keep attached images available to the downstream agent. If the input contains only pasted material and no separate request, return that material unchanged.
 
 You may be given two context blocks before the user's request:
 - "Recent conversation": prior turns in this session. Use to resolve pronouns, references like "fix that", and follow-ups that depend on earlier intent.
@@ -426,6 +442,7 @@ Rules (in strict priority order):
 	async function rephrase(
 		ctx: InputContext,
 		originalText: string,
+		images: readonly ImageContent[] | undefined,
 		signal: AbortSignal,
 		depth: HistoryDepth,
 	): Promise<string | null> {
@@ -450,7 +467,8 @@ Rules (in strict priority order):
 					type: "text" as const,
 					text: sections.join("\n\n"),
 				},
-			],
+				...(images ?? []),
+			] as (TextContent | ImageContent)[],
 			timestamp: Date.now(),
 		};
 
@@ -470,6 +488,44 @@ Rules (in strict priority order):
 		return text.length > 0 ? text : null;
 	}
 
+	async function loadClipboardImages(text: string): Promise<ImageContent[]> {
+		const paths = [...text.matchAll(CLIPBOARD_IMAGE_REFERENCE)]
+			.map((match) => match[1])
+			.filter((path): path is string => typeof path === "string");
+		if (paths.length === 0) return [];
+
+		const temporaryDirectory = resolve(tmpdir());
+		const images: ImageContent[] = [];
+		for (const path of paths) {
+			const absolutePath = resolve(path);
+			const fileName = basename(absolutePath);
+			const extension = extname(fileName).toLowerCase();
+			const mimeType = CLIPBOARD_IMAGE_MIME_TYPES[extension];
+			if (
+				!mimeType ||
+				!/^pi-clipboard-[0-9a-f-]+\.(?:png|jpe?g|gif|webp|bmp)$/iu.test(fileName) ||
+				(absolutePath !== temporaryDirectory &&
+					!absolutePath.startsWith(`${temporaryDirectory}${sep}`))
+			) {
+				continue;
+			}
+			try {
+				const data = await readFile(absolutePath);
+				images.push({ type: "image", data: data.toString("base64"), mimeType });
+			} catch {
+				// Keep original path when clipboard file disappeared or cannot be read.
+			}
+		}
+		if (process.env.PI_REPHRASE_DEBUG === "1" && paths.length > 0) {
+			process.stderr.write(`[clipboard-image] detected=${paths.length} loaded=${images.length}\n`);
+		}
+		return images;
+	}
+
+	function removeClipboardImageReferences(text: string): string {
+		return text.replace(CLIPBOARD_IMAGE_REFERENCE, "").trim();
+	}
+
 	// ── Input handler — gates, interrupt, env config, flow ──────
 
 	pi.on("input", async (event, ctx) => {
@@ -482,27 +538,51 @@ Rules (in strict priority order):
 		if (event.streamingBehavior === "steer") return { action: "continue" };
 		if (event.streamingBehavior === "followUp") return { action: "continue" };
 
+		// TUI image paste inserts Pi's temporary image path into editor. Convert
+		// that explicit clipboard payload into an image attachment before gates.
+		if (process.env.PI_REPHRASE_DEBUG === "1" && event.text.includes("pi-clipboard-")) {
+			process.stderr.write(`[clipboard-input] ${JSON.stringify(event.text)}\n`);
+		}
+		const clipboardImages = await loadClipboardImages(event.text);
+		const inputText =
+			clipboardImages.length > 0
+				? removeClipboardImageReferences(event.text)
+				: event.text;
+		const inputImages =
+			clipboardImages.length > 0
+				? [...(event.images ?? []), ...clipboardImages]
+				: event.images;
+		const passThrough = () =>
+			clipboardImages.length > 0
+				? {
+						action: "transform" as const,
+						text: inputText,
+						images: inputImages,
+					}
+				: { action: "continue" as const };
+
 		// `@file` references — the `input` event sees raw text BEFORE Pi
 		// resolves `@file` to file contents. Rephrasing here would preserve
 		// an unresolved reference and could distort the explicit file request.
-		if (event.text.includes("@")) return { action: "continue" };
+		if (inputText.includes("@")) return passThrough();
 
 		// Slash-command-shaped input — if no extension command matched,
 		// `/foo bar` reaches us as prose. Rephrasing it produces "Execute
 		// the foo command with the bar argument" which strips the user's
 		// leading `/` and invents intent.
-		if (event.text.startsWith("/")) return { action: "continue" };
+		if (inputText.startsWith("/")) return passThrough();
 
-		// Empty / whitespace-only input — nothing to rephrase.
-		if (event.text.trim().length === 0) return { action: "continue" };
+		// Empty / whitespace-only input — nothing to rephrase. Clipboard-only
+		// input still needs a transform so Pi receives the decoded image.
+		if (inputText.trim().length === 0) return passThrough();
 
 		// User interrupt — honor before any work, including notify.
 		const userSignal = c.signal;
-		if (userSignal?.aborted) return { action: "continue" };
+		if (userSignal?.aborted) return passThrough();
 
 		const model = c.model;
-		if (!model) return { action: "continue" };
-		if (!c.modelRegistry.hasConfiguredAuth?.(model)) return { action: "continue" };
+		if (!model) return passThrough();
+		if (!c.modelRegistry.hasConfiguredAuth?.(model)) return passThrough();
 
 		// Env config.
 		const timeoutMs = readPositiveEnvNumber(
@@ -524,7 +604,7 @@ Rules (in strict priority order):
 		// FIFO entry when the corresponding UserMessage finalizes. Keep a
 		// reference to this entry so failure cleanup removes this request,
 		// not whichever request was queued most recently.
-		const pendingOriginal = { text: event.text };
+		const pendingOriginal = { text: inputText };
 		pendingOriginals.push(pendingOriginal);
 
 		// Now we know we're going to do work — notify only then.
@@ -543,7 +623,7 @@ Rules (in strict priority order):
 		let rephrased: string | null;
 		try {
 			rephrased = await withRetry(
-				(signal) => rephrase(c, event.text, signal, depth),
+				(signal) => rephrase(c, inputText, inputImages, signal, depth),
 				{
 					maxRetries,
 					baseMs: retryBaseMs,
@@ -564,12 +644,12 @@ Rules (in strict priority order):
 			// diagnosis. Don't train the user to ignore noisy notifications.
 			if (debug) {
 				process.stderr.write(
-					`[rephrase-skip] ${event.text.slice(0, 80)}\n`,
+					`[rephrase-skip] ${inputText.slice(0, 80)}\n`,
 				);
 			}
 			const pendingIndex = pendingOriginals.indexOf(pendingOriginal);
 			if (pendingIndex !== -1) pendingOriginals.splice(pendingIndex, 1);
-			return { action: "continue" };
+			return passThrough();
 		}
 
 		if (c.hasUI)
@@ -582,6 +662,10 @@ Rules (in strict priority order):
 				`\n===[REPHRASE]===\n${rephrased}\n===[END]===\n\n`,
 			);
 		}
-		return { action: "transform", text: rephrased };
+		return {
+			action: "transform",
+			text: rephrased,
+			...(inputImages === undefined ? {} : { images: inputImages }),
+		};
 	});
 }

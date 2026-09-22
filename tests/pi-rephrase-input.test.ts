@@ -125,6 +125,114 @@ function promptText(call: Call): string {
 	return call.context.messages[0].content[0].text;
 }
 
+test("keeps pasted text explicit in the rephrase request", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const pastedText = [
+			"Please fix this error:",
+			"```ts",
+			"const answer = await brokenCall();",
+			"```",
+		].join("\n");
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Fix the pasted error." }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: pastedText },
+			contextFor(cwd, registry),
+		);
+
+		assert.deepEqual(result, { action: "transform", text: "Fix the pasted error." });
+		assert.match(promptText(calls[0]), /Please fix this error:/);
+		assert.match(promptText(calls[0]), /const answer = await brokenCall\(\);/);
+		assert.match(calls[0].context.systemPrompt, /pasted text.*preserve.*exactly/is);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("passes pasted images to the rephrase model and transformed input", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const image = {
+			type: "image" as const,
+			data: "aGVsbG8=",
+			mimeType: "image/png",
+		};
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Inspect the attached screenshot." }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "look at this screenshot", images: [image] },
+			contextFor(cwd, registry),
+		);
+
+		assert.equal(calls.length, 1);
+		assert.deepEqual(calls[0].context.messages[0].content, [
+			{ type: "text", text: "User request:\n\nlook at this screenshot" },
+			image,
+		]);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Inspect the attached screenshot.",
+			images: [image],
+		});
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("converts Pi's temporary clipboard image path into an attachment", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	const pastedImagePath = join(tmpdir(), "pi-clipboard-012207-0000.png");
+	const imageBytes = Buffer.from([1, 2, 3]);
+	writeFileSync(pastedImagePath, imageBytes);
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Inspect the pasted image." }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: `inspect this pasted image ${pastedImagePath}` },
+			contextFor(cwd, registry),
+		);
+		const image = { type: "image", data: imageBytes.toString("base64"), mimeType: "image/png" };
+
+		assert.deepEqual(calls[0].context.messages[0].content, [
+			{ type: "text", text: "User request:\n\ninspect this pasted image" },
+			image,
+		]);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Inspect the pasted image.",
+			images: [image],
+		});
+	} finally {
+		rmSync(pastedImagePath, { force: true });
+		cleanup(cwd);
+	}
+});
+
 test("never discovers, reads, or sends project files", async () => {
 	clearEnv();
 	const cwd = makeProject({
