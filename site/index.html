@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f4f0e8" />
-    <meta name="description" content="Pi Rephrase Input intercepts ordinary Pi prompts, asks the active model which project files matter, then returns one clearer instruction. Same model. Same workflow. Better first sentence." />
+    <meta name="description" content="Pi Rephrase Input intercepts ordinary Pi prompts, uses relevant conversation history, then returns one clearer instruction. Same model. Same workflow. Better first sentence." />
     <script>document.documentElement.classList.replace("no-js", "js");</script>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./favicon.svg" />
@@ -39,7 +39,7 @@
             <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Pi extension · Input layer</p>
             <h1 id="hero-title" class="display">Sharper sentences.<br />Same Pi.</h1>
             <p class="lede">
-              Pi Rephrase Input intercepts ordinary prompts, asks the active model which project files matter, then returns one clearer instruction to Pi. The model stays the same. The workflow stays the same. Only the first sentence changes.
+              Pi Rephrase Input intercepts ordinary prompts, uses relevant conversation history, then returns one clearer instruction to Pi. The model stays the same. The workflow stays the same. Only the first sentence changes.
             </p>
             <div class="hero-actions">
               <a class="button button-primary" href="#install">Install in Pi <span aria-hidden="true">↓</span></a>
@@ -62,11 +62,10 @@
 
                 <hr class="console-rule" aria-hidden="true" />
 
-                <p class="console-caption">selecting context</p>
-                <ul class="file-pills" aria-label="Selected project files">
-                  <li class="pill pill-selected">AGENTS.md</li>
-                  <li class="pill pill-selected">src/auth.ts</li>
-                  <li class="pill pill-selected">auth.test.ts</li>
+                <p class="console-caption">using recent conversation</p>
+                <ul class="file-pills" aria-label="Recent conversation">
+                  <li class="pill pill-selected">U: fix the auth thing</li>
+                  <li class="pill pill-selected">A: auth uses refresh tokens</li>
                 </ul>
 
                 <p class="console-caption">rephrasing with <span class="mono-strong accent-text">openai / gpt-5</span></p>
@@ -88,7 +87,7 @@
           </div>
           <div class="proof-cell">
             <span class="proof-number">02</span>
-            <span class="proof-label">≤ 8 context files. Selection is bounded; the model picks from validated paths.</span>
+            <span class="proof-label">Conversation-aware. Follow-ups receive only relevant recent history.</span>
           </div>
           <div class="proof-cell">
             <span class="proof-number">03</span>
@@ -113,16 +112,16 @@
             <li class="workflow-step">
               <span class="step-num">01</span>
               <div class="step-body">
-                <h3>Discover</h3>
-                <p>Walk the project from the current working directory and build a small, readable inventory. Skip dependency trees, generated output, binary files, and anything that looks like a secret.</p>
+                <h3>Capture</h3>
+                <p>Keep original user and assistant messages plus recent tool results in a bounded session buffer. Project files are never scanned.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">⌘</span>
             </li>
             <li class="workflow-step">
               <span class="step-num">02</span>
               <div class="step-body">
-                <h3>Select</h3>
-                <p>Ask the active model which paths help answer this request. Validate every path against the offered inventory and the project boundary. Cap the selection at eight files.</p>
+                <h3>Bound</h3>
+                <p>Choose a short recent-history window from the session buffer. No extra classifier call can delay the rephrase.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">◎</span>
             </li>
@@ -130,7 +129,7 @@
               <span class="step-num">03</span>
               <div class="step-body">
                 <h3>Rephrase</h3>
-                <p>Hand the selected context to the same model and return one sharper prompt to Pi's normal input pipeline. Pi does the rest.</p>
+                <p>Hand only required conversation context to the same model and return one sharper prompt to Pi's normal input pipeline. Pi does the rest.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">↗</span>
             </li>
@@ -160,8 +159,8 @@
               <dd>Mid-stream steering is passed through. Rephrasing only runs on completed, interactive prompts.</dd>
             </div>
             <div class="contract-row">
-              <dt class="mono">selector fails</dt>
-              <dd>Empty or malformed selection does not block rephrase. The rephrase step still runs, with empty context, and falls through on its own failure.</dd>
+              <dt class="mono">conversation context</dt>
+              <dd>Recent history stays bounded and uses original user wording. The cwd is never scanned, read, or sent to the model; use explicit <span class="mono">@file</span> references when needed.</dd>
             </div>
             <div class="contract-row">
               <dt class="mono">rephrase fails</dt>
@@ -191,17 +190,17 @@
               <tr>
                 <td class="mono config-name">PI_REPHRASE_TIMEOUT_MS</td>
                 <td class="mono config-default">8000</td>
-                <td class="config-desc">Maximum time for the full rephrase loop, including context loading.</td>
+                <td class="config-desc">Maximum time for each rephrase attempt.</td>
               </tr>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_MAX_CONTEXT_CHARS</td>
-                <td class="mono config-default">6000</td>
-                <td class="config-desc">Hard ceiling on total characters loaded into the rephrase prompt.</td>
+                <td class="mono config-name">PI_REPHRASE_MAX_RETRIES</td>
+                <td class="mono config-default">2</td>
+                <td class="config-desc">Retries transient rephrase failures.</td>
               </tr>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_SELECTION_TIMEOUT_MS</td>
-                <td class="mono config-default">2500</td>
-                <td class="config-desc">Maximum time for the file-selection step before falling through.</td>
+                <td class="mono config-name">PI_REPHRASE_RETRY_BASE_MS</td>
+                <td class="mono config-default">500</td>
+                <td class="config-desc">Base delay for exponential retry backoff.</td>
               </tr>
               <tr>
                 <td class="mono config-name">PI_REPHRASE_OFF</td>

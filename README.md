@@ -2,11 +2,7 @@
 
 Context-aware input rephrasing for [Pi](https://pi.dev).
 
-Pi Rephrase Input intercepts ordinary user prompts, asks the active model which project files matter, then rewrites the request into a clear, actionable prompt. It keeps Pi's normal flow when disabled, interrupted, unavailable, or when rephrasing fails.
-
-<p align="center">
-  <img src="./site/pi-rephrase-input-overview.png" alt="Pi Rephrase Input workflow overview" width="1448" height="1086" />
-</p>
+Pi Rephrase Input intercepts ordinary user prompts, adds only relevant conversation history, then rewrites the request into a clear, actionable prompt. It never discovers, reads, or injects project files. It keeps Pi's normal flow when disabled, interrupted, unavailable, or when rephrasing fails.
 
 ## Install
 
@@ -31,14 +27,13 @@ pi -p "Explain the next change in this project"
 
 ## Behavior
 
-1. Discover readable project files while excluding dependency trees, generated output, binary files, and sensitive filenames.
-2. Ask the active Pi model to select up to eight relevant paths.
-3. Validate selected paths against the offered inventory and project boundary.
-4. Load only selected files, preserving per-file and total context limits.
-5. Ask the same active model to rephrase the original request.
-6. Pass the rephrased prompt back into Pi.
+1. Capture original user and assistant messages plus recent tool results for the session.
+2. Choose a bounded recent-history window from the session buffer.
+3. Add that conversation context to the rephrase request.
+4. Ask the same active model to rephrase the original request.
+5. Pass the rephrased prompt back into Pi.
 
-Selector failures produce an empty project context and do not block the existing rephrase flow. Rephrase failures pass the original input through unchanged.
+The extension never scans the cwd or sends project-file contents to the model. Rephrase failures pass the original input through unchanged.
 
 ## What gets skipped
 
@@ -59,8 +54,6 @@ The conversation buffer holds **original** user wording, not rephrased output, s
 
 ```bash
 PI_REPHRASE_TIMEOUT_MS=8000             # per-attempt wall-clock cap (default 8000)
-PI_REPHRASE_MAX_CONTEXT_CHARS=6000      # total chars of selected file content (default 6000)
-PI_REPHRASE_SELECTION_TIMEOUT_MS=2500   # per-attempt cap on selector + classifier (default timeout/3)
 PI_REPHRASE_MAX_RETRIES=2               # retries on transient LLM errors (default 2, 0 disables)
 PI_REPHRASE_RETRY_BASE_MS=500           # exponential backoff base (default 500)
 PI_REPHRASE_OFF=1                       # kill switch — passes everything through

@@ -105,7 +105,7 @@ components:
 
 ## Overview
 
-This site reads like a precision-instrument specification sheet — the single-page document a watchmaker or optical-instrument maker ships with a product. The audience is a developer who already uses Pi and wants to know exactly what this extension changes and what it leaves alone. The substrate is plain static HTML, CSS, and a small JS file served from `site/`, with no build step and no framework. The posture is quiet: monochrome on warm paper, hairline rules as the dominant separator, one accent for the selection voice, no decoration that does not earn its place.
+This site reads like a precision-instrument specification sheet — the single-page document a watchmaker or optical-instrument maker ships with a product. The audience is a developer who already uses Pi and wants to know exactly what this extension changes and what it leaves alone. The substrate is plain static HTML, CSS, and a small JS file served from `site/`, with no build step and no framework. The posture is quiet: monochrome on warm paper, hairline rules as the dominant separator, one accent for the conversation voice, no decoration that does not earn its place.
 
 ## Colors
 
@@ -113,7 +113,7 @@ The palette is grayscale-on-paper plus one accent. Six named colors, each with o
 
 - **Primary `#131311`** — A near-black ink. Headlines, primary text, the dark install CTA. Maximum readability against the paper.
 - **Secondary `#5e605b`** — A warm slate. Captions, metadata, body copy in low-emphasis roles, the eyebrow over each section.
-- **Tertiary `#a83823`** — A single brick red. The voice of selection and the cursor. Appears on no other surface. Passes WCAG AA on neutral for body-size text.
+- **Tertiary `#a83823`** — A single brick red. The voice of conversation context and the cursor. Appears on no other surface. Passes WCAG AA on neutral for body-size text.
 - **Neutral `#f4f0e8`** — A warm paper. The page surface. Softer than pure white; reads as ink on paper, not pixels on a screen.
 - **Panel `#ebe5d7`** — A slightly darker paper. The console and install panels sit one tone below the page — depth by value, not by shadow.
 - **Rule `#d8d2c4`** — Hairline divider color. Every section break in the page is this color, one pixel wide.
@@ -130,7 +130,7 @@ Two typefaces: **Inter** for prose, **JetBrains Mono** for technical detail. Dis
 - **Body** — Inter 16 / 40 weight, line-height 1.6. Long-form copy.
 - **Small** — Inter 13 / 40 weight, line-height 1.55. Captions and card descriptions.
 - **Mono** — JetBrains Mono 12 / 40 weight. File paths, env vars, commands.
-- **Mono-strong** — JetBrains Mono 12 / 50 weight. Identifiers that must read at a glance — the active model id, the selected file names.
+- **Mono-strong** — JetBrains Mono 12 / 50 weight. Identifiers that must read at a glance — the active model id, recent-history labels.
 - **Eyebrow** — JetBrains Mono 11 / 50 weight, uppercase, tracking +0.08em. The label that sits above each section's title.
 
 Italic exists in the body weight for inline term emphasis. It is never used in display or H2.
@@ -150,10 +150,10 @@ Mostly square. Cards, the console, the install panel, and the command block all 
 ## Components
 
 - **Header.** Left: a brand mark — a small `›_` glyph in the accent, followed by the wordmark — and the package name. Right: navigation links and an external repo link. A one-pixel hairline rule underlines the header on every viewport.
-- **Hero.** Two columns on desktop (left copy, right console), stacked on mobile. The display headline is the largest size on the page. The console reproduces a real input-to-rephrase transformation: the rough prompt at the top, the model-selected files in mono pills, the rephrased output below, and a blinking accent cursor as the only motion.
+- **Hero.** Two columns on desktop (left copy, right console), stacked on mobile. The display headline is the largest size on the page. The console reproduces a real input-to-rephrase transformation: the rough prompt at the top, recent conversation snippets in mono pills, the rephrased output below, and a blinking accent cursor as the only motion.
 - **Proof line.** Four cells separated by hairline dividers. Each cell shows a monospace numeral and a short label. Reads like a spec sheet summary row.
 - **Workflow.** Three numbered rows separated by hairline rules. Each row is a three-column grid: monospace numeral, title and description, a single mono symbol on the right.
-- **Behavior contract.** A short list of guaranteed states — what the extension does when disabled, when input comes from another extension, when the selector fails, and when the rephrase times out. Each item is one line of mono caption followed by one sentence of body copy.
+- **Behavior contract.** A short list of guaranteed states — what the extension does when disabled, when input comes from another extension, how conversation context stays bounded, when project files are present, and when the rephrase times out. Each item is one line of mono caption followed by one sentence of body copy.
 - **Configuration.** A flat, no-border table of env var names (mono) and their default values (mono, right-aligned). No zebra striping, no card chrome.
 - **Install.** A paper panel containing one mono command line and a square copy button. Below the command, two smaller lines in mono offer the local-checkout alternative and a one-line verification.
 - **Footer.** Brand mark on the left, repo link on the right, separated from the page by a hairline rule above.
@@ -163,10 +163,10 @@ Mostly square. Cards, the console, the install panel, and the command block all 
 ### Do
 
 - Use hairline rules to separate sections, not whitespace alone.
-- Keep the accent on the selection voice only: the cursor, the chosen file names, the link hover, the install CTA.
+- Keep the accent on the conversation voice only: the cursor, recent-history labels, the link hover, the install CTA.
 - Use mono for every technical detail: file paths, command strings, env var names, model identifiers, numeric values.
 - Use sans for narrative copy.
-- Reproduce real product behavior in the console example — the rough prompt at the top, the model-selected files in the middle, the rephrased output at the bottom.
+- Reproduce real product behavior in the console example — the rough prompt at the top, recent conversation in the middle, the rephrased output at the bottom.
 - Honour `prefers-reduced-motion`: the cursor still blinks; reveal-on-scroll becomes instant.
 
 ### Don't
