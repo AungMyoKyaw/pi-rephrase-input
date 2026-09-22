@@ -81,18 +81,75 @@ function selectFallback(button) {
 
 function flashButton(button, state) {
   const original = button.textContent;
+  const originalLabel = button.getAttribute("aria-label");
+  const status = button.closest(".install-panel")?.querySelector("[data-copy-status]");
+  const copied = state === "copied";
+
   button.dataset.state = state;
-  button.textContent = state === "copied" ? "Copied" : "Select text";
+  button.textContent = copied ? "Copied" : "Select text";
+  button.setAttribute(
+    "aria-label",
+    copied ? "Install command copied" : "Select install command text to copy",
+  );
+  if (status) {
+    status.textContent = copied
+      ? "Install command copied."
+      : "Install command selected. Copy the selected text manually.";
+  }
 
   window.setTimeout(() => {
     delete button.dataset.state;
     button.textContent = original || "Copy";
+    if (originalLabel) button.setAttribute("aria-label", originalLabel);
+    if (status) status.textContent = "";
   }, 1600);
+}
+
+function initMobileNavigation() {
+  const header = document.querySelector(".site-header");
+  const toggle = document.querySelector(".menu-toggle");
+  const nav = document.querySelector("#site-nav");
+  if (!header || !toggle || !nav) return;
+
+  const setOpen = (open, restoreFocus = false) => {
+    header.classList.toggle("is-menu-open", open);
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    toggle.textContent = open ? "Close" : "Menu";
+    if (restoreFocus) toggle.focus();
+  };
+
+  toggle.addEventListener("click", () => {
+    setOpen(!header.classList.contains("is-menu-open"));
+  });
+
+  nav.addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("a")) {
+      setOpen(false);
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (
+      header.classList.contains("is-menu-open") &&
+      event.target instanceof Node &&
+      !header.contains(event.target)
+    ) {
+      setOpen(false);
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && header.classList.contains("is-menu-open")) {
+      setOpen(false, true);
+    }
+  });
 }
 
 function init() {
   initReveal();
   initCopyButtons();
+  initMobileNavigation();
 }
 
 if (document.readyState === "loading") {

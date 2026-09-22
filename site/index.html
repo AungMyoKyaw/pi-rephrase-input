@@ -17,13 +17,14 @@
   <body>
     <a class="skip-link" href="#main">Skip to main content</a>
 
-    <div class="page-shell">
+    <div class="page-shell" id="top">
       <header class="site-header" data-reveal>
         <a class="brand" href="#top" aria-label="Pi Rephrase Input — home">
           <span class="brand-mark" aria-hidden="true">›_</span>
           <span class="brand-name">Pi Rephrase Input</span>
         </a>
-        <nav class="site-nav" aria-label="Primary">
+        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Open navigation">Menu</button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary">
           <a href="#how-it-works">How it works</a>
           <a href="#contract">Contract</a>
           <a href="#install">Install</a>
@@ -32,8 +33,6 @@
       </header>
 
       <main id="main">
-        <span id="top" class="anchor"></span>
-
         <section class="hero" aria-labelledby="hero-title" data-reveal>
           <div class="hero-copy">
             <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Pi extension · Input layer</p>
@@ -188,29 +187,29 @@
             </thead>
             <tbody>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_TIMEOUT_MS</td>
-                <td class="mono config-default">8000</td>
-                <td class="config-desc">Maximum time for each rephrase attempt.</td>
+                <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_TIMEOUT_MS</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>8000</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Maximum time for each rephrase attempt.</td>
               </tr>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_MAX_RETRIES</td>
-                <td class="mono config-default">2</td>
-                <td class="config-desc">Retries transient rephrase failures.</td>
+                <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_MAX_RETRIES</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>2</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Retries transient rephrase failures.</td>
               </tr>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_RETRY_BASE_MS</td>
-                <td class="mono config-default">500</td>
-                <td class="config-desc">Base delay for exponential retry backoff.</td>
+                <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_RETRY_BASE_MS</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>500</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Base delay for exponential retry backoff.</td>
               </tr>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_OFF</td>
-                <td class="mono config-default">0</td>
-                <td class="config-desc">Set to <span class="mono">1</span> to bypass rephrasing entirely.</td>
+                <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_OFF</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>0</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Set to <span class="mono">1</span> to bypass rephrasing entirely.</td>
               </tr>
               <tr>
-                <td class="mono config-name">PI_REPHRASE_DEBUG</td>
-                <td class="mono config-default">0</td>
-                <td class="config-desc">Set to <span class="mono">1</span> to write the rephrased text to stderr.</td>
+                <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_DEBUG</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>0</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Set to <span class="mono">1</span> to write the rephrased text to stderr.</td>
               </tr>
             </tbody>
           </table>
@@ -228,6 +227,7 @@
               <code class="command"><span class="command-prompt" aria-hidden="true">$</span> pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input</code>
               <button class="copy-button" type="button" data-copy="pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input" aria-label="Copy install command">Copy</button>
             </div>
+            <span class="sr-only copy-status" data-copy-status role="status" aria-live="polite" aria-atomic="true"></span>
 
             <p class="install-alt">
               Local checkout <span class="meta-sep" aria-hidden="true">·</span> <code class="mono">pi install /path/to/pi-rephrase-input</code>

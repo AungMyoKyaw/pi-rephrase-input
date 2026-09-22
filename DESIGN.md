@@ -167,7 +167,7 @@ Mostly square. Cards, the console, the install panel, and the command block all 
 - Use mono for every technical detail: file paths, command strings, env var names, model identifiers, numeric values.
 - Use sans for narrative copy.
 - Reproduce real product behavior in the console example — the rough prompt at the top, recent conversation in the middle, the rephrased output at the bottom.
-- Honour `prefers-reduced-motion`: the cursor still blinks; reveal-on-scroll becomes instant.
+- Honour `prefers-reduced-motion`: reveal-on-scroll becomes instant and the cursor animation stops.
 
 ### Don't
 
