@@ -350,6 +350,90 @@ test("buffer keeps original user wording after a transform", async () => {
 	}
 });
 
+test("buffer keeps original user wording even when Pi's recorded timestamp differs", async () => {
+	// Regression for the second-prompt rephrase bug: Pi records the
+	// UserMessage with its own `Date.now()` AFTER our transform completes,
+	// so the timestamp on `message_end`'s message never matches the one
+	// we captured at input-handler entry. Earlier versions keyed a Map by
+	// the captured timestamp, so the lookup always missed and the buffer
+	// captured rephrased output instead of user wording — every turn
+	// after the first drifted from the user's voice.
+	clearEnv();
+	const cwd = makeProject({ "README.md": "PROJECT_FILE_CANARY" });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				if (calls.length === 1) return { content: [{ type: "text", text: "VERBOSE_REPHRASE" }] };
+				return { content: [{ type: "text", text: "second" }] };
+			},
+		};
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
+		fireSessionStart();
+		await handler(
+			{ source: "interactive", text: "fix the auth bug" },
+			contextFor(cwd, registry),
+		);
+		// Pi's UserMessage timestamp diverges from the extension's captured one.
+		fireMessageEnd({ message: userMsg("VERBOSE_REPHRASE", Date.now() + 7_777) });
+		fireMessageEnd({ message: assistantMsg("ok, fixed the auth path") });
+
+		await handler(
+			{ source: "interactive", text: "and the test too" },
+			contextFor(cwd, registry),
+		);
+		// Same divergence on the second prompt.
+		fireMessageEnd({ message: userMsg("second", Date.now() + 9_999) });
+
+		// The rephraser for prompt 2 must see the ORIGINAL wording of
+		// prompt 1, not its rephrased form.
+		assert.match(promptText(calls[1]), /U: fix the auth bug/);
+		assert.doesNotMatch(promptText(calls[1]), /VERBOSE_REPHRASE/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("rephrase failure pops the pending original so message_end falls back to the input text", async () => {
+	// When rephrasing fails and we pass the input through unchanged,
+	// Pi's UserMessage carries the original text and our pending FIFO
+	// entry must be removed so `message_end` records it via the
+	// content-extraction fallback.
+	clearEnv();
+	process.env.PI_REPHRASE_MAX_RETRIES = "0";
+	const cwd = makeProject({ "README.md": "PROJECT_FILE_CANARY" });
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				throw new Error("provider down");
+			},
+		};
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
+		fireSessionStart();
+		await handler(
+			{ source: "interactive", text: "do the thing" },
+			contextFor(cwd, registry),
+		);
+		fireMessageEnd({ message: userMsg("do the thing", Date.now() + 5) });
+
+		await handler(
+			{ source: "interactive", text: "and now also this" },
+			contextFor(cwd, registry),
+		);
+
+		// Second rephrase must see the first prompt's ORIGINAL text, even
+		// though it was passed through unchanged (not rephrased).
+		assert.match(promptText(calls[1]), /U: do the thing/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
 test("rephrase retries transient failures", async () => {
 	clearEnv();
 	process.env.PI_REPHRASE_MAX_RETRIES = "1";

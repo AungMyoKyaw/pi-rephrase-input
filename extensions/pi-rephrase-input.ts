@@ -83,12 +83,19 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	// ── Rolling buffers for session-aware rephrasing ────────────
 	const conversationBuffer: ConversationTurn[] = [];
 	const toolResultBuffer: ToolResultSnapshot[] = [];
-	// Map from transformed user-message timestamp → original text. Used
-	// to recover the original wording from `message_end` after our own
-	// transform rewrote it. Without this, the buffer captures our
-	// rephrased output and feeds it back on the next turn, compounding
-	// verbosity and drifting from user voice across a session.
-	const originalsByTimestamp = new Map<number, string>();
+	// FIFO queue of originals for prompts we are about to (or have just)
+	// transformed. `message_end` shifts the head when the corresponding
+	// user message finalizes; the input handler pops on rephrase failure.
+	// Pi awaits the input handler before creating the UserMessage, so the
+	// order of pushes equals the order of `message_end` fires.
+	//
+	// The earlier implementation keyed a Map by `Date.now()` captured at
+	// input-handler entry. Pi records the UserMessage with its own
+	// `Date.now()` AFTER our transform completes, so the keys never
+	// matched and the buffer captured rephrased output instead of user
+	// wording — violating the README contract on every turn after the
+	// first. FIFO ordering removes the timestamp dependency entirely.
+	const pendingOriginals: string[] = [];
 
 	function recordTurn(role: "user" | "assistant", text: string): void {
 		const trimmed = text.trim();
@@ -185,7 +192,7 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	pi.on("session_start", () => {
 		conversationBuffer.length = 0;
 		toolResultBuffer.length = 0;
-		originalsByTimestamp.clear();
+		pendingOriginals.length = 0;
 	});
 
 	// message_end is the single capture point for both user and assistant
@@ -206,13 +213,14 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 
 		if (m.role === "user") {
 			// Prefer the original text captured at input time (before our
-			// transform). Falls back to the message content if the input
-			// came from a path that didn't record originals (e.g. RPC).
-			const timestamp = typeof m.timestamp === "number" ? m.timestamp : undefined;
-			const original = timestamp !== undefined ? originalsByTimestamp.get(timestamp) : undefined;
+			// transform). FIFO order matches because Pi awaits the input
+			// handler before creating the UserMessage. Falls back to the
+			// message content when no input-handler push is pending (e.g.
+			// RPC / extension-sourced user messages that the input handler
+			// short-circuited — those still carry the original text).
+			const original = pendingOriginals.shift();
 			if (original !== undefined) {
 				recordTurn("user", original);
-				if (timestamp !== undefined) originalsByTimestamp.delete(timestamp);
 				return;
 			}
 			const text = Array.isArray(m.content)
@@ -470,12 +478,13 @@ Rules (in strict priority order):
 				: DEFAULT_RETRY_BASE_MS;
 		const debug = process.env.PI_REPHRASE_DEBUG === "1";
 
-		// Capture original text so the buffer holds user wording, not our
-		// rephrase output, on subsequent turns. Timestamp is assigned when
-		// we return the transform — Pi records that same timestamp on the
-		// UserMessage. We approximate with Date.now() at capture time.
-		const capturedTimestamp = Date.now();
-		originalsByTimestamp.set(capturedTimestamp, event.text);
+		// Queue the original text so the buffer holds user wording, not our
+		// rephrase output, on subsequent turns. `message_end` shifts this
+		// FIFO entry when the corresponding UserMessage finalizes. If
+		// rephrasing fails, we pop the entry below before falling through
+		// to passthrough so `message_end` falls back to extracting the
+		// original from `m.content` (which is `event.text` in passthrough).
+		pendingOriginals.push(event.text);
 
 		// Now we know we're going to do work — notify only then.
 		if (c.hasUI) c.ui!.notify("Rephrasing with conversation context…", "info");
@@ -508,7 +517,7 @@ Rules (in strict priority order):
 					`[rephrase-skip] ${event.text.slice(0, 80)}\n`,
 				);
 			}
-			originalsByTimestamp.delete(capturedTimestamp);
+			pendingOriginals.pop();
 			return { action: "continue" };
 		}
 
