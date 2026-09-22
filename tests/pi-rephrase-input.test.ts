@@ -92,21 +92,21 @@ function captureHandler(): {
 
 function captureAllHandlers(): {
 	handler: (event: any, context: any) => Promise<unknown>;
-	fireSessionStart: () => void;
+	fireSessionStart: (context?: any) => void;
 	fireMessageEnd: (event: any) => void;
 } {
 	const captured: {
 		handler?: (event: any, context: any) => Promise<unknown>;
-		sessionStart?: () => void;
+		sessionStart?: (context?: any) => void;
 		messageEnd?: (event: any) => void;
 	} = {};
 	rephraseInput({
 		on: (event: string, registered: (e?: any, c?: any) => Promise<unknown> | unknown) => {
 			if (event === "session_start") {
-				captured.sessionStart = () => void registered();
+				captured.sessionStart = (context?: any) => void registered(undefined, context);
 			} else if (event === "message_end") {
 				captured.messageEnd = (e: any) => void registered(e);
-			} else {
+			} else if (event === "input") {
 				captured.handler = registered as (event: any, context: any) => Promise<unknown>;
 			}
 		},
@@ -429,6 +429,120 @@ test("rephrase failure pops the pending original so message_end falls back to th
 		// Second rephrase must see the first prompt's ORIGINAL text, even
 		// though it was passed through unchanged (not rephrased).
 		assert.match(promptText(calls[1]), /U: do the thing/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("terminal Escape and Ctrl-C abort an active rephrase", async () => {
+	clearEnv();
+	process.env.PI_REPHRASE_MAX_RETRIES = "0";
+	const cwd = makeProject({});
+	try {
+		let terminalInput: ((data: string) => unknown) | undefined;
+		const signals: AbortSignal[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (
+				_model: unknown,
+				_context: unknown,
+				options?: Call["options"],
+			) => {
+				const signal = options?.signal;
+				if (!signal) throw new Error("missing rephrase signal");
+				signals.push(signal);
+				return new Promise<Completion>((_resolve, reject) => {
+					signal.addEventListener(
+						"abort",
+						() => reject(new Error("aborted by terminal input")),
+						{ once: true },
+					);
+				});
+			},
+		};
+		const { handler, fireSessionStart } = captureAllHandlers();
+		fireSessionStart({
+			mode: "tui",
+			ui: {
+				onTerminalInput: (listener: (data: string) => unknown) => {
+					terminalInput = listener;
+					return () => {};
+				},
+			},
+		});
+		assert.ok(terminalInput, "TUI terminal listener registered");
+
+		const runCancelled = async (key: string): Promise<void> => {
+			const pending = handler(
+				{ source: "interactive", text: `cancel with ${key}` },
+				contextFor(cwd, registry),
+			);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(signals.length > 0, true);
+			assert.equal(terminalInput?.(key), undefined, "interrupt key is not consumed");
+			assert.equal(signals.at(-1)?.aborted, true);
+			assert.deepEqual(await pending, { action: "continue" });
+		};
+
+		await runCancelled("\u001b");
+		await runCancelled("\u0003");
+	} finally {
+		clearEnv();
+		cleanup(cwd);
+	}
+});
+
+test("invalid infinite retry configuration falls back to finite defaults", async () => {
+	clearEnv();
+	process.env.PI_REPHRASE_MAX_RETRIES = "Infinity";
+	process.env.PI_REPHRASE_RETRY_BASE_MS = "Infinity";
+	const cwd = makeProject({});
+	try {
+		let attempts = 0;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => {
+				attempts++;
+				throw new Error("provider down");
+			},
+		};
+		const { handler } = captureHandler();
+		assert.deepEqual(
+			await handler(
+				{ source: "interactive", text: "do the thing" },
+				contextFor(cwd, registry),
+			),
+			{ action: "continue" },
+		);
+		assert.equal(attempts, 3, "invalid Infinity retries use the default of two retries");
+	} finally {
+		clearEnv();
+		cleanup(cwd);
+	}
+});
+
+test("records string-form user messages when no pending transformed input exists", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "rephrased" }] };
+			},
+		};
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
+		fireSessionStart();
+		fireMessageEnd({ message: { role: "user", content: "raw string user message" } });
+
+		await handler(
+			{ source: "interactive", text: "follow up" },
+			contextFor(cwd, registry),
+		);
+
+		assert.match(promptText(calls[0]), /U: raw string user message/);
 	} finally {
 		cleanup(cwd);
 	}

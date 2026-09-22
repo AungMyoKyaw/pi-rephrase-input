@@ -33,7 +33,7 @@ pi -p "Explain the next change in this project"
 4. Ask the same active model to rephrase the original request.
 5. Pass the rephrased prompt back into Pi.
 
-The extension never scans the cwd or sends project-file contents to the model. Rephrase failures pass the original input through unchanged.
+The extension never scans the cwd or sends project-file contents to the model. Rephrase failures pass the original input through unchanged. In TUI mode, Escape and Ctrl-C abort an active rephrase request immediately; the original input then passes through unchanged.
 
 ## What gets skipped
 
@@ -58,6 +58,7 @@ PI_REPHRASE_MAX_RETRIES=2               # retries on transient LLM errors (defau
 PI_REPHRASE_RETRY_BASE_MS=500           # exponential backoff base (default 500)
 PI_REPHRASE_OFF=1                       # kill switch — passes everything through
 PI_REPHRASE_DEBUG=1                     # log retries + rephrase failures to stderr
+                                        # invalid/non-finite numeric values use defaults
 ```
 
 ## Development

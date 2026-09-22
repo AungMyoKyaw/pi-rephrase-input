@@ -95,7 +95,9 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	// matched and the buffer captured rephrased output instead of user
 	// wording — violating the README contract on every turn after the
 	// first. FIFO ordering removes the timestamp dependency entirely.
-	const pendingOriginals: string[] = [];
+	const pendingOriginals: { text: string }[] = [];
+	const activeRephraseControllers = new Set<AbortController>();
+	let removeTerminalInputListener: (() => void) | undefined;
 
 	function recordTurn(role: "user" | "assistant", text: string): void {
 		const trimmed = text.trim();
@@ -155,44 +157,79 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	// conversation buffer provides prior-turn grounding without another
 	// model call that could time out before rephrasing starts.
 
-	function extractAssistantText(message: unknown): string {
-		if (!message || typeof message !== "object") return "";
-		const m = message as { content?: unknown };
-		// AssistantMessage.content is typed as an array of text/thinking/tool
-		// blocks. A top-level `text` field never appears on assistant
-		// messages — the array path is the only real path.
-		if (!Array.isArray(m.content)) return "";
+	function extractContentText(content: unknown): string {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
 		const parts: string[] = [];
-		for (const part of m.content) {
-			if (part && typeof part === "object" && "text" in part && typeof (part as { text: unknown }).text === "string") {
+		for (const part of content) {
+			if (
+				part &&
+				typeof part === "object" &&
+				"text" in part &&
+				typeof (part as { text: unknown }).text === "string"
+			) {
 				parts.push((part as { text: string }).text);
 			}
 		}
 		return parts.join("\n");
 	}
 
+	function extractAssistantText(message: unknown): string {
+		if (!message || typeof message !== "object") return "";
+		const m = message as { content?: unknown };
+		// AssistantMessage.content is typed as an array of text/thinking/tool
+		// blocks. A top-level `text` field never appears on assistant
+		// messages — the array path is the only real path.
+		return extractContentText(m.content);
+	}
+
 	function extractToolResultText(toolResult: unknown): string {
 		if (!toolResult || typeof toolResult !== "object") return "";
-		const t = toolResult as { toolName?: unknown; content?: unknown; text?: unknown };
+		const t = toolResult as { content?: unknown; text?: unknown };
 		if (typeof t.text === "string") return t.text;
-		if (Array.isArray(t.content)) {
-			const parts: string[] = [];
-			for (const part of t.content) {
-				if (part && typeof part === "object" && "text" in part && typeof (part as { text: unknown }).text === "string") {
-					parts.push((part as { text: string }).text);
-				}
-			}
-			return parts.join("\n");
+		return extractContentText(t.content);
+	}
+
+	function abortActiveRephrases(): void {
+		if (process.env.PI_REPHRASE_DEBUG === "1" && activeRephraseControllers.size > 0) {
+			process.stderr.write(
+				`[rephrase-interrupt] aborting ${activeRephraseControllers.size} active request(s)\n`,
+			);
 		}
-		return "";
+		for (const controller of activeRephraseControllers) {
+			controller.abort();
+		}
 	}
 
 	// ── Subscribe to session lifecycle for context capture ──────
 	// session_start: reset the buffer so a new session starts fresh.
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		conversationBuffer.length = 0;
 		toolResultBuffer.length = 0;
 		pendingOriginals.length = 0;
+		abortActiveRephrases();
+		removeTerminalInputListener?.();
+		removeTerminalInputListener = undefined;
+
+		// Pi's input context has no abort signal while idle, which is when
+		// this input handler runs. Subscribe to raw TUI input instead so
+		// Escape/Ctrl-C can cancel a rephrase while its provider request is
+		// in flight. Never consume the key; Pi still handles its normal
+		// interrupt behavior after this listener runs.
+		if (ctx?.mode === "tui") {
+			removeTerminalInputListener = ctx.ui.onTerminalInput((data) => {
+				if (data === "\u001b" || data === "\u0003") {
+					abortActiveRephrases();
+				}
+				return undefined;
+			});
+		}
+	});
+
+	pi.on("session_shutdown", () => {
+		abortActiveRephrases();
+		removeTerminalInputListener?.();
+		removeTerminalInputListener = undefined;
 	});
 
 	// message_end is the single capture point for both user and assistant
@@ -220,21 +257,10 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 			// short-circuited — those still carry the original text).
 			const original = pendingOriginals.shift();
 			if (original !== undefined) {
-				recordTurn("user", original);
+				recordTurn("user", original.text);
 				return;
 			}
-			const text = Array.isArray(m.content)
-				? m.content
-						.filter(
-							(part): part is { text: string } =>
-								!!part &&
-								typeof part === "object" &&
-								"text" in part &&
-								typeof (part as { text: unknown }).text === "string",
-						)
-						.map((part) => part.text)
-						.join("\n")
-				: "";
+			const text = extractContentText(m.content);
 			if (text) recordTurn("user", text);
 			return;
 		}
@@ -249,6 +275,20 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	const DEFAULT_TIMEOUT_MS = 8000;
 	const DEFAULT_MAX_RETRIES = 2;
 	const DEFAULT_RETRY_BASE_MS = 500;
+
+	function readPositiveEnvNumber(name: string, fallback: number): number {
+		const raw = process.env[name];
+		if (raw === undefined || raw.trim() === "") return fallback;
+		const value = Number(raw);
+		return Number.isFinite(value) && value > 0 ? value : fallback;
+	}
+
+	function readNonNegativeEnvInteger(name: string, fallback: number): number {
+		const raw = process.env[name];
+		if (raw === undefined || raw.trim() === "") return fallback;
+		const value = Number(raw);
+		return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+	}
 
 	const REPHRASE_SYSTEM_PROMPT = `You are a request rephraser for a coding agent. Your only job: take the user's raw request and rewrite it as a clear, actionable prompt that another LLM can execute well.
 
@@ -465,26 +505,27 @@ Rules (in strict priority order):
 		if (!c.modelRegistry.hasConfiguredAuth?.(model)) return { action: "continue" };
 
 		// Env config.
-		const timeoutMs = Number(process.env.PI_REPHRASE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
-		const maxRetries =
-			process.env.PI_REPHRASE_MAX_RETRIES !== undefined &&
-			process.env.PI_REPHRASE_MAX_RETRIES !== ""
-				? Math.max(0, Number(process.env.PI_REPHRASE_MAX_RETRIES) || 0)
-				: DEFAULT_MAX_RETRIES;
-		const retryBaseMs =
-			process.env.PI_REPHRASE_RETRY_BASE_MS !== undefined &&
-			process.env.PI_REPHRASE_RETRY_BASE_MS !== ""
-				? Math.max(1, Number(process.env.PI_REPHRASE_RETRY_BASE_MS) || DEFAULT_RETRY_BASE_MS)
-				: DEFAULT_RETRY_BASE_MS;
+		const timeoutMs = readPositiveEnvNumber(
+			"PI_REPHRASE_TIMEOUT_MS",
+			DEFAULT_TIMEOUT_MS,
+		);
+		const maxRetries = readNonNegativeEnvInteger(
+			"PI_REPHRASE_MAX_RETRIES",
+			DEFAULT_MAX_RETRIES,
+		);
+		const retryBaseMs = readPositiveEnvNumber(
+			"PI_REPHRASE_RETRY_BASE_MS",
+			DEFAULT_RETRY_BASE_MS,
+		);
 		const debug = process.env.PI_REPHRASE_DEBUG === "1";
 
 		// Queue the original text so the buffer holds user wording, not our
 		// rephrase output, on subsequent turns. `message_end` shifts this
-		// FIFO entry when the corresponding UserMessage finalizes. If
-		// rephrasing fails, we pop the entry below before falling through
-		// to passthrough so `message_end` falls back to extracting the
-		// original from `m.content` (which is `event.text` in passthrough).
-		pendingOriginals.push(event.text);
+		// FIFO entry when the corresponding UserMessage finalizes. Keep a
+		// reference to this entry so failure cleanup removes this request,
+		// not whichever request was queued most recently.
+		const pendingOriginal = { text: event.text };
+		pendingOriginals.push(pendingOriginal);
 
 		// Now we know we're going to do work — notify only then.
 		if (c.hasUI) c.ui!.notify("Rephrasing with conversation context…", "info");
@@ -496,17 +537,26 @@ Rules (in strict priority order):
 
 		// Rephrase through withRetry. On retry exhaustion, rephrase returns
 		// null and the original input passes through unchanged.
-		const rephrased = await withRetry(
-			(signal) => rephrase(c, event.text, signal, depth),
-			{
-				maxRetries,
-				baseMs: retryBaseMs,
-				timeoutMs,
-				signal: userSignal,
-				label: "rephrase",
-				debug,
-			},
-		);
+		const rephraseController = new AbortController();
+		activeRephraseControllers.add(rephraseController);
+		const unlinkUserSignal = linkAbortSignals(userSignal, rephraseController);
+		let rephrased: string | null;
+		try {
+			rephrased = await withRetry(
+				(signal) => rephrase(c, event.text, signal, depth),
+				{
+					maxRetries,
+					baseMs: retryBaseMs,
+					timeoutMs,
+					signal: rephraseController.signal,
+					label: "rephrase",
+					debug,
+				},
+			);
+		} finally {
+			activeRephraseControllers.delete(rephraseController);
+			unlinkUserSignal();
+		}
 
 		if (!rephrased) {
 			// Silent on benign skips — the start notification already told
@@ -517,7 +567,8 @@ Rules (in strict priority order):
 					`[rephrase-skip] ${event.text.slice(0, 80)}\n`,
 				);
 			}
-			pendingOriginals.pop();
+			const pendingIndex = pendingOriginals.indexOf(pendingOriginal);
+			if (pendingIndex !== -1) pendingOriginals.splice(pendingIndex, 1);
 			return { action: "continue" };
 		}
 
