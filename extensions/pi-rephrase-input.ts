@@ -516,9 +516,6 @@ Rules (in strict priority order):
 				// Keep original path when clipboard file disappeared or cannot be read.
 			}
 		}
-		if (process.env.PI_REPHRASE_DEBUG === "1" && paths.length > 0) {
-			process.stderr.write(`[clipboard-image] detected=${paths.length} loaded=${images.length}\n`);
-		}
 		return images;
 	}
 
@@ -540,9 +537,6 @@ Rules (in strict priority order):
 
 		// TUI image paste inserts Pi's temporary image path into editor. Convert
 		// that explicit clipboard payload into an image attachment before gates.
-		if (process.env.PI_REPHRASE_DEBUG === "1" && event.text.includes("pi-clipboard-")) {
-			process.stderr.write(`[clipboard-input] ${JSON.stringify(event.text)}\n`);
-		}
 		const clipboardImages = await loadClipboardImages(event.text);
 		const inputText =
 			clipboardImages.length > 0
