@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f4f0e8" />
-    <meta name="description" content="Pi Rephrase Input intercepts ordinary Pi prompts, uses relevant conversation history, then returns one clearer instruction. Same model. Same workflow. Better first sentence." />
+    <meta name="description" content="Pi Rephrase Input adds bounded session context to eligible Pi prompts, then returns one clearer instruction through the same model and workflow." />
     <script>document.documentElement.classList.replace("no-js", "js");</script>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./favicon.svg" />
@@ -38,13 +38,13 @@
             <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Pi extension · Input layer</p>
             <h1 id="hero-title" class="display">Sharper sentences.<br />Same Pi.</h1>
             <p class="lede">
-              Pi Rephrase Input intercepts ordinary prompts, uses relevant conversation history, then returns one clearer instruction to Pi. The model stays the same. The workflow stays the same. Only the first sentence changes.
+              Pi Rephrase Input intercepts eligible interactive prompts, adds bounded session context when available, then returns one clearer instruction to Pi. The model stays the same. The workflow stays the same. Only the first sentence changes.
             </p>
             <div class="hero-actions">
               <a class="button button-primary" href="#install">Install in Pi <span aria-hidden="true">↓</span></a>
               <a class="link-arrow" href="#how-it-works">See the flow <span aria-hidden="true">→</span></a>
             </div>
-            <p class="microcopy">Works with the model already selected in your Pi session. No new provider to configure.</p>
+            <p class="microcopy">Uses the model already selected in your Pi session. No new provider or project-file scan.</p>
           </div>
 
           <aside class="hero-console" aria-label="Example input and rephrased output">
@@ -56,21 +56,22 @@
               <div class="console-body">
                 <div class="console-line">
                   <span class="prompt accent-text" aria-hidden="true">›</span>
-                  <span class="input">fix the auth thing and make tests pass</span>
+                  <span class="input">fix the failing auth test</span>
                 </div>
 
                 <hr class="console-rule" aria-hidden="true" />
 
-                <p class="console-caption">using recent conversation</p>
-                <ul class="file-pills" aria-label="Recent conversation">
-                  <li class="pill pill-selected">U: fix the auth thing</li>
+                <p class="console-caption">using bounded session context</p>
+                <ul class="file-pills" aria-label="Recent conversation and tool results">
+                  <li class="pill pill-selected">U: explain the auth flow</li>
                   <li class="pill pill-selected">A: auth uses refresh tokens</li>
+                  <li class="pill pill-selected">[bash]: auth.test.ts is failing</li>
                 </ul>
 
-                <p class="console-caption">rephrasing with <span class="mono-strong accent-text">openai / gpt-5</span></p>
+                <p class="console-caption">rephrasing with <span class="mono-strong accent-text">active model</span></p>
                 <div class="console-output">
                   <span class="prompt accent-text" aria-hidden="true">↳</span>
-                  <span class="output-text">Fix the authentication flow and update its tests. Preserve existing behavior outside the auth boundary.</span>
+                  <span class="output-text">Fix the failing authentication test for the refresh-token flow.</span>
                 </div>
 
                 <div class="cursor-block" aria-hidden="true"></div>
@@ -82,19 +83,19 @@
         <section class="proof-line" aria-label="Product properties" data-reveal>
           <div class="proof-cell">
             <span class="proof-number">01</span>
-            <span class="proof-label">Active model. Rephrase uses the model already in your Pi session.</span>
+            <span class="proof-label">Active model. Rephrase uses the model already selected in your Pi session.</span>
           </div>
           <div class="proof-cell">
             <span class="proof-number">02</span>
-            <span class="proof-label">Conversation-aware. Follow-ups receive only relevant recent history.</span>
+            <span class="proof-label">Bounded context. Up to six conversation messages and three tool-result snapshots.</span>
           </div>
           <div class="proof-cell">
             <span class="proof-number">03</span>
-            <span class="proof-label">8 s timeout. The whole loop is bounded; on timeout Pi receives your input unchanged.</span>
+            <span class="proof-label">No project files. The extension never scans the cwd or sends file contents.</span>
           </div>
           <div class="proof-cell">
             <span class="proof-number">04</span>
-            <span class="proof-label">Pass-through. Pi receives the original input on any failure.</span>
+            <span class="proof-label">Pass-through. Skipped, failed, or interrupted requests keep original text and attachments.</span>
           </div>
         </section>
 
@@ -103,7 +104,7 @@
             <p class="eyebrow">How it works</p>
             <h2 id="how-title">Three steps, one fallback.</h2>
             <p class="lede">
-              The extension sits in front of Pi's normal input pipeline. On every interactive, non-steering prompt, it runs a short loop and hands the rephrased text back. If anything in the loop fails, Pi receives the original input unchanged.
+              The extension sits in front of Pi's normal input pipeline. For eligible interactive prompts, it runs a short loop and hands the rephrased text back. Gated, interrupted, or failed requests pass through unchanged.
             </p>
           </header>
 
@@ -112,7 +113,7 @@
               <span class="step-num">01</span>
               <div class="step-body">
                 <h3>Capture</h3>
-                <p>Keep original user and assistant messages plus recent tool results in a bounded session buffer. Project files are never scanned.</p>
+                <p>Capture original user and assistant messages plus recent tool results in bounded session buffers. Project files are never scanned.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">⌘</span>
             </li>
@@ -120,7 +121,7 @@
               <span class="step-num">02</span>
               <div class="step-body">
                 <h3>Bound</h3>
-                <p>Choose a short recent-history window from the session buffer. No extra classifier call can delay the rephrase.</p>
+                <p>Use the last two conversation messages for short histories, or the full six-message buffer for longer ones. Keep up to three tool-result snapshots and no extra classifier call.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">◎</span>
             </li>
@@ -128,7 +129,7 @@
               <span class="step-num">03</span>
               <div class="step-body">
                 <h3>Rephrase</h3>
-                <p>Hand only required conversation context to the same model and return one sharper prompt to Pi's normal input pipeline. Pi does the rest.</p>
+                <p>Ask the same selected model for one sharper prompt. Preserve pasted payload and attached images, then return both text and images to Pi.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">↗</span>
             </li>
@@ -140,7 +141,7 @@
             <p class="eyebrow">The contract</p>
             <h2 id="contract-title">Quiet by design.</h2>
             <p class="lede">
-              Every state below is observable from Pi's own notifications. The extension never traps a prompt.
+              Pass-through is the default outside a successful transform. The extension never traps a prompt.
             </p>
           </header>
 
@@ -150,20 +151,20 @@
               <dd>Set <span class="mono">PI_REPHRASE_OFF=1</span> and Pi receives your input unchanged. There is no other way to mis-route the prompt.</dd>
             </div>
             <div class="contract-row">
-              <dt class="mono">extension-sourced input</dt>
-              <dd>Other extensions' output is passed through. Only interactive prompts are rephrased.</dd>
-            </div>
-            <div class="contract-row">
-              <dt class="mono">steer streaming</dt>
-              <dd>Mid-stream steering is passed through. Rephrasing only runs on completed, interactive prompts.</dd>
+              <dt class="mono">input gates</dt>
+              <dd>Extension and RPC messages, steer and follow-up inputs, empty text, text containing <span class="mono">@</span>, slash commands, and sessions without a model or auth skip the rephrase model call. Eligible interactive input can still normalize supported clipboard images into attachments.</dd>
             </div>
             <div class="contract-row">
               <dt class="mono">conversation context</dt>
-              <dd>Recent history stays bounded and uses original user wording. The cwd is never scanned, read, or sent to the model; use explicit <span class="mono">@file</span> references when needed.</dd>
+              <dd>Original wording stays in a rolling buffer of six messages. Tool results keep three snapshots. Conversation and tool text are capped at 2,000 and 1,000 characters; the cwd is never scanned or sent.</dd>
             </div>
             <div class="contract-row">
-              <dt class="mono">rephrase fails</dt>
-              <dd>Timeout, missing authentication, or empty model output — Pi receives the original input. Set <span class="mono">PI_REPHRASE_DEBUG=1</span> to see the rephrased text in stderr.</dd>
+              <dt class="mono">pasted payload</dt>
+              <dd>Pasted text is marked as user payload and preserved exactly by the rephrase prompt. Attached images go to the rephrase model and return with transformed input. Pi TUI clipboard paths are decoded from its temporary directory and removed from the text.</dd>
+            </div>
+            <div class="contract-row">
+              <dt class="mono">interrupt or failure</dt>
+              <dd>TUI Escape and Ctrl-C abort active requests. Timeout, provider error, empty output, or retry exhaustion sends original text and attachments through. <span class="mono">PI_REPHRASE_DEBUG=1</span> logs diagnostics to stderr.</dd>
             </div>
           </dl>
         </section>
@@ -189,27 +190,27 @@
               <tr>
                 <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_TIMEOUT_MS</td>
                 <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>8000</td>
-                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Maximum time for each rephrase attempt.</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Wall-clock cap for each rephrase attempt; retries can add more total time.</td>
               </tr>
               <tr>
                 <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_MAX_RETRIES</td>
                 <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>2</td>
-                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Retries transient rephrase failures.</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Additional attempts after transient thrown errors; <span class="mono">0</span> disables retries.</td>
               </tr>
               <tr>
                 <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_RETRY_BASE_MS</td>
                 <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>500</td>
-                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Base delay for exponential retry backoff.</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Base cap for jittered exponential retry backoff.</td>
               </tr>
               <tr>
                 <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_OFF</td>
-                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>0</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>unset</td>
                 <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Set to <span class="mono">1</span> to bypass rephrasing entirely.</td>
               </tr>
               <tr>
                 <td class="mono config-name"><span class="config-mobile-label" aria-hidden="true">Name</span>PI_REPHRASE_DEBUG</td>
-                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>0</td>
-                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Set to <span class="mono">1</span> to write the rephrased text to stderr.</td>
+                <td class="mono config-default"><span class="config-mobile-label" aria-hidden="true">Default</span>unset</td>
+                <td class="config-desc"><span class="config-mobile-label" aria-hidden="true">Effect</span>Set to <span class="mono">1</span> to log rephrased output and retry/skip/interrupt diagnostics to stderr.</td>
               </tr>
             </tbody>
           </table>
@@ -218,14 +219,14 @@
         <section class="section install" id="install" aria-labelledby="install-title" data-reveal>
           <div class="install-panel">
             <p class="eyebrow">Install</p>
-            <h2 id="install-title">One command. Private repo.</h2>
+            <h2 id="install-title">One command. SSH access.</h2>
             <p class="lede">
-              The package is hosted on GitHub and requires SSH authentication. After install, Pi loads the extension on every session until you remove it.
+              The private package is hosted on GitHub and uses SSH authentication. Pin <span class="mono">master</span> when installing; Pi loads the extension on every session until you remove it.
             </p>
 
             <div class="command-row">
-              <code class="command"><span class="command-prompt" aria-hidden="true">$</span> pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input</code>
-              <button class="copy-button" type="button" data-copy="pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input" aria-label="Copy install command">Copy</button>
+              <code class="command"><span class="command-prompt" aria-hidden="true">$</span> pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input@master</code>
+              <button class="copy-button" type="button" data-copy="pi install git:git@github.com:AungMyoKyaw/pi-rephrase-input@master" aria-label="Copy install command">Copy</button>
             </div>
             <span class="sr-only copy-status" data-copy-status role="status" aria-live="polite" aria-atomic="true"></span>
 

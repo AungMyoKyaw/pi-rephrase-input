@@ -2,7 +2,7 @@
 
 Context-aware input rephrasing for [Pi](https://pi.dev).
 
-Pi Rephrase Input intercepts ordinary user prompts, adds only relevant conversation history, then rewrites the request into a clear, actionable prompt. It never discovers, reads, or injects project files. It keeps Pi's normal flow when disabled, interrupted, unavailable, or when rephrasing fails.
+Pi Rephrase Input intercepts eligible interactive prompts, adds bounded recent conversation and tool-result context when available, then asks the model already selected in the Pi session to rewrite the request as one clear, actionable prompt. It never discovers, reads, or injects project files. When a request is skipped, interrupted, unavailable, or rephrasing fails, Pi keeps its normal input flow.
 
 ## Install
 
@@ -27,37 +27,40 @@ pi -p "Explain the next change in this project"
 
 ## Behavior
 
-1. Capture original user and assistant messages plus recent tool results for the session.
-2. Choose a bounded recent-history window from the session buffer.
-3. Add that conversation context to the rephrase request.
-4. Ask the same active model to rephrase the original request.
-5. Pass the rephrased prompt back into Pi.
+1. Reset session context at `session_start` and capture original user/assistant message text plus recent tool results from `message_end`.
+2. Keep at most six user/assistant messages and three tool-result snapshots in rolling buffers.
+3. For short histories, send the last two conversation messages. For longer histories, send the full bounded conversation buffer. Cap formatted conversation at 2,000 characters and tool results at 1,000 characters.
+4. Ask the currently selected Pi model to rephrase the original request with that context. No classifier call runs first.
+5. Preserve attached images in the rephrase request and in the transformed input returned to Pi. Detect Pi TUI clipboard paths named `pi-clipboard-...` in the system temporary directory, load supported image files as attachments, and remove those paths from the text. The rephrase prompt treats pasted text, code, logs, documents, and quoted content as payload and instructs the model to preserve it exactly.
+6. Pass the rephrased prompt back into Pi's normal input pipeline. Clipboard-only image input still returns an image attachment without a model call.
 
-The extension never scans the cwd or sends project-file contents to the model. Rephrase failures pass the original input through unchanged. In TUI mode, Escape and Ctrl-C abort an active rephrase request immediately; the original input then passes through unchanged.
+The extension never scans the cwd or sends project-file contents to the model. Explicit `@file` inputs pass through unchanged so Pi can resolve them itself. The conversation buffer stores original user wording, not rephrased output.
 
 ## What gets skipped
 
-The extension short-circuits (passes input through unchanged) for any of these:
+The extension skips the rephrase model call for any of these. For eligible interactive input, a supported Pi clipboard image path is still normalized into an image attachment during pass-through.
 
 - `PI_REPHRASE_OFF=1` (kill switch).
-- `event.source === "extension"` (messages from `sendUserMessage` / other extensions).
+- `event.source === "extension"` (messages from `sendUserMessage` or other extensions).
 - `event.source === "rpc"` (RPC clients typically manage their own context).
-- `event.streamingBehavior === "steer"` or `"followUp"` (mid-stream redirects and queued follow-ups — by the time a follow-up is delivered, the agent already has the conversation context).
-- Input containing `@` (`@file` references — Pi resolves them after `input`, so the rephraser would produce internally inconsistent output).
-- Input starting with `/` (slash commands — if no extension command matched, the rephraser would strip the leading `/` and invent intent).
-- Empty / whitespace-only input.
+- `event.streamingBehavior === "steer"` or `"followUp"` (mid-stream redirects and queued follow-ups).
+- Input containing `@` (`@file` references are resolved by Pi after the `input` event).
+- Input starting with `/` (slash commands).
+- Empty or whitespace-only input.
 - No model selected, or no auth configured for the active model.
 
-The conversation buffer holds **original** user wording, not rephrased output, so each turn conditions on what the user actually said.
+## Fallback and interruption
+
+A timeout, thrown provider error, `stopReason: "error"`, empty response, or retry exhaustion passes the original text through unchanged and preserves attachments. `PI_REPHRASE_MAX_RETRIES` controls additional attempts after transient thrown errors; the default is two retries. Escape and Ctrl-C in TUI mode abort active rephrase requests without consuming the key, then pass the original text and attachments through. Session start and shutdown also abort active requests.
 
 ## Configuration
 
 ```bash
 PI_REPHRASE_TIMEOUT_MS=8000             # per-attempt wall-clock cap (default 8000)
-PI_REPHRASE_MAX_RETRIES=2               # retries on transient LLM errors (default 2, 0 disables)
-PI_REPHRASE_RETRY_BASE_MS=500           # exponential backoff base (default 500)
+PI_REPHRASE_MAX_RETRIES=2               # additional attempts after transient errors (default 2, 0 disables)
+PI_REPHRASE_RETRY_BASE_MS=500           # jittered exponential backoff base (default 500)
 PI_REPHRASE_OFF=1                       # kill switch — passes everything through
-PI_REPHRASE_DEBUG=1                     # log retries + rephrase failures to stderr
+PI_REPHRASE_DEBUG=1                     # log rephrased output and retry/skip/interrupt diagnostics to stderr
                                         # invalid/non-finite numeric values use defaults
 ```
 
