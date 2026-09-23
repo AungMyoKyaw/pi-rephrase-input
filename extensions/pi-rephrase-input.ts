@@ -238,6 +238,14 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		return extractContentText(t.content);
 	}
 
+	function isInterruptKey(data: string): boolean {
+		if (data === "\u0003") return true;
+		// Pi's Kitty keyboard protocol encodes Ctrl+C as CSI 99;5u, not ETX.
+		const kittyKey = /^\u001b\[99;(\d+)(?::([123]))?u$/u.exec(data);
+		if (!kittyKey || kittyKey[2] === "3") return false;
+		return ((Number(kittyKey[1]) - 1) & 4) !== 0;
+	}
+
 	function abortActiveRephrases(): void {
 		if (process.env.PI_REPHRASE_DEBUG === "1" && activeRephraseControllers.size > 0) {
 			process.stderr.write(
@@ -270,7 +278,7 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		if (ctx?.mode === "tui") {
 			removeTerminalInputListener = ctx.ui.onTerminalInput((data) => {
 				captureTerminalPastes(data);
-				if (data === "\u001b" || data === "\u0003") {
+				if (data === "\u001b" || isInterruptKey(data)) {
 					abortActiveRephrases();
 				}
 				return undefined;
@@ -328,7 +336,9 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	const DEFAULT_MAX_RETRIES = 2;
 	const DEFAULT_RETRY_BASE_MS = 500;
 	const CLIPBOARD_IMAGE_REFERENCE =
-		/((?:(?:[A-Za-z]:)?[/\\][^\s"'`]*?)?pi-clipboard-[0-9a-f-]+\.(?:png|jpe?g|gif|webp|bmp))(?=$|[\s"'`])/giu;
+		/((?:(?:[A-Za-z]:)?[/\\][^\s"'`]*?)?pi-clipboard-[0-9a-f-]+\.(?:png|jpe?g|gif|webp|bmp))(?=$|[\s"'`.!,;:!?)}\]])/giu;
+	const IMAGE_PATH_REFERENCE =
+		/(?<![\w@])(?:"(?:~\/|\.{1,2}\/|\/|[A-Za-z]:[\\/])[^"\r\n]*?\.(?:png|jpe?g|gif|webp|bmp|tiff?)"|'(?:~\/|\.{1,2}\/|\/|[A-Za-z]:[\\/])[^'\r\n]*?\.(?:png|jpe?g|gif|webp|bmp|tiff?)'|(?:~\/|\.{1,2}\/|\/|[A-Za-z]:[\\/])[^"'`<>|\r\n]*?\.(?:png|jpe?g|gif|webp|bmp|tiff?)(?=$|[\s"'`<>|.,;:!?)}\]]))/giu;
 	const MENTIONED_FILE_REFERENCE = /(?<![\w@])@(?:"[^"\r\n]+"|[^\s"'`)}\],;]+)/gu;
 	const FENCED_TEXT_PAYLOAD =
 		/^[ \t]*(`{3,}|~{3,})[^\r\n]*(?:\r?\n)[\s\S]*?^[ \t]*\1[ \t]*\r?$/gmu;
@@ -576,6 +586,11 @@ Rules (in strict priority order):
 				addCandidate(match[0], match.index);
 			}
 		}
+		for (const match of text.matchAll(IMAGE_PATH_REFERENCE)) {
+			if (match[0] !== undefined && match.index !== undefined) {
+				addCandidate(match[0], match.index);
+			}
+		}
 		for (const match of text.matchAll(MENTIONED_FILE_REFERENCE)) {
 			if (match[0] !== undefined && match.index !== undefined) {
 				addCandidate(match[0], match.index);
@@ -653,16 +668,6 @@ Rules (in strict priority order):
 		return images;
 	}
 
-	function removeClipboardImageReferences(text: string, loadedPaths: readonly string[]): string {
-		const loaded = new Set(loadedPaths);
-		const result = text.replace(CLIPBOARD_IMAGE_REFERENCE, (path) => loaded.has(path) ? "" : path);
-		// Remove the single separator left by a trailing image path, not
-		// whitespace belonging to pasted text elsewhere in the request.
-		return loadedPaths.some((path) => text.endsWith(` ${path}`))
-			? result.slice(0, -1)
-			: result;
-	}
-
 	// ── Input handler — gates, interrupt, env config, flow ──────
 
 	pi.on("input", async (event, ctx) => {
@@ -678,10 +683,7 @@ Rules (in strict priority order):
 		// TUI image paste inserts Pi's temporary image path into editor. Convert
 		// that explicit clipboard payload into an image attachment before gates.
 		const clipboardImages = await loadClipboardImages(event.text);
-		const inputText =
-			clipboardImages.length > 0
-				? removeClipboardImageReferences(event.text, clipboardImages.map(({ path }) => path))
-				: event.text;
+		const inputText = event.text;
 		const inputImages =
 			clipboardImages.length > 0
 				? [...(event.images ?? []), ...clipboardImages.map(({ image }) => image)]
@@ -697,14 +699,18 @@ Rules (in strict priority order):
 					}
 				: { action: "continue" as const };
 
-		// Mentioned files and other payload references stay in inputText so the
-		// rephrase model can include them unchanged in its output.
+		// Mentioned files, image paths, and other payload references stay in
+		// inputText so the rephrase model can include them unchanged in output.
 
 		// Slash-command-shaped input — if no extension command matched,
 		// `/foo bar` reaches us as prose. Rephrasing it produces "Execute
 		// the foo command with the bar argument" which strips the user's
-		// leading `/` and invents intent.
-		if (inputText.startsWith("/")) return passThrough();
+		// leading `/` and invents intent. A leading absolute image path is
+		// ordinary request payload, not a slash command.
+		const beginsWithImagePath = [...inputText.matchAll(IMAGE_PATH_REFERENCE)].some(
+			(match) => match.index === 0,
+		);
+		if (inputText.startsWith("/") && !beginsWithImagePath) return passThrough();
 
 		// Empty text without an image attachment — nothing to rephrase.
 		// Image-only input still flows through; whitespace-only text does not.

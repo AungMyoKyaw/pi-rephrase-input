@@ -231,6 +231,52 @@ test("rephrases mentioned files and preserves each reference", async () => {
 	}
 });
 
+test("rephrases requests starting with an image path and preserves pasted text and attachments", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let terminalInput: ((data: string) => unknown) | undefined;
+		const imagePath = "/var/folders/tmp/Screenshot\\ 2026-09-23\\ at\\ 10.42.23\u202fAM.png";
+		const pastedText = "  pasted note  \nsecond line\t";
+		const originalText = `${imagePath}.\nPlease describe the screenshot and use this note: ${pastedText}`;
+		const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Inspect the screenshot and pasted note." }] };
+			},
+		};
+		const { handler, fireSessionStart } = captureAllHandlers();
+		fireSessionStart({
+			mode: "tui",
+			ui: { onTerminalInput: (listener: (data: string) => unknown) => {
+				terminalInput = listener;
+				return () => {};
+			} },
+		});
+		terminalInput?.(`\u001b[200~${pastedText}\u001b[201~`);
+
+		const result = await handler(
+			{ source: "interactive", text: originalText, images: [image] },
+			contextFor(cwd, registry),
+		);
+
+		assert.equal(calls.length, 1, "a leading image path must not be mistaken for a slash command");
+		assert.ok(promptText(calls[0]).includes(`${imagePath}.`));
+		assert.ok(promptText(calls[0]).includes(pastedText));
+		assert.deepEqual(calls[0].context.messages[0].content[1], image);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: ["Inspect the screenshot and pasted note.", imagePath, pastedText].join("\n\n"),
+			images: [image],
+		});
+	} finally {
+		cleanup(cwd);
+	}
+});
+
 test("rephrases a pasted image without accompanying text", async () => {
 	clearEnv();
 	const cwd = makeProject({});
@@ -327,7 +373,7 @@ test("omits pasted text payload the model already copied verbatim", async () => 
 			);
 			assert.deepEqual(result, {
 				action: "transform",
-				text: "Found nothing.",
+				text: ["Found nothing.", path].join("\n\n"),
 				images: [{ type: "image", data: imageBytes.toString("base64"), mimeType: "image/png" }],
 			});
 		} finally {
@@ -370,7 +416,7 @@ test("rephrases a fully pasted request without duplicating its instruction", asy
 	}
 });
 
-test("converts Pi's temporary clipboard image path into an attachment", async () => {
+test("converts a clipboard image path followed by punctuation into an attachment", async () => {
 	clearEnv();
 	const cwd = makeProject({});
 	const pastedImagePath = join(tmpdir(), "pi-clipboard-012207-0000.png");
@@ -387,18 +433,18 @@ test("converts Pi's temporary clipboard image path into an attachment", async ()
 		};
 		const { handler } = captureHandler();
 		const result = await handler(
-			{ source: "interactive", text: `inspect this pasted image ${pastedImagePath}` },
+			{ source: "interactive", text: `inspect this pasted image ${pastedImagePath}.` },
 			contextFor(cwd, registry),
 		);
 		const image = { type: "image", data: imageBytes.toString("base64"), mimeType: "image/png" };
 
 		assert.deepEqual(calls[0].context.messages[0].content, [
-			{ type: "text", text: "User request:\n\ninspect this pasted image" },
+			{ type: "text", text: `User request:\n\ninspect this pasted image ${pastedImagePath}.` },
 			image,
 		]);
 		assert.deepEqual(result, {
 			action: "transform",
-			text: "Inspect the pasted image.",
+			text: ["Inspect the pasted image.", pastedImagePath].join("\n\n"),
 			images: [image],
 		});
 	} finally {
@@ -424,7 +470,7 @@ test("keeps pasted text whitespace when decoding a clipboard image", async () =>
 		);
 		assert.deepEqual(result, {
 			action: "transform",
-			text: "Inspect the content.\n\n  Paste:\n  code  \n",
+			text: ["Inspect the content.", `  Paste:\n  code  \n ${pastedImagePath}`].join("\n\n"),
 			images: [{ type: "image", data: "Bg==", mimeType: "image/png" }],
 		});
 	} finally {
@@ -451,7 +497,7 @@ test("keeps unreadable clipboard paths when another image loads", async () => {
 		);
 		assert.deepEqual(result, {
 			action: "transform",
-			text: `Inspect the available image.\n\n${missingPath}`,
+			text: ["Inspect the available image.", loadedPath, missingPath].join("\n\n"),
 			images: [{ type: "image", data: "BAU=", mimeType: "image/png" }],
 		});
 	} finally {
@@ -882,6 +928,7 @@ test("terminal Escape and Ctrl-C abort an active rephrase", async () => {
 
 		await runCancelled("\u001b");
 		await runCancelled("\u0003");
+		await runCancelled("\u001b[99;5u");
 	} finally {
 		clearEnv();
 		cleanup(cwd);
