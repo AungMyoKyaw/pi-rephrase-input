@@ -38,7 +38,7 @@
             <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> Pi extension · Input layer</p>
             <h1 id="hero-title" class="display">Sharper sentences.<br />Same Pi.</h1>
             <p class="lede">
-              Pi Rephrase Input intercepts eligible interactive prompts, adds bounded session context when available, then returns one clearer instruction to Pi. The model stays the same. The workflow stays the same. Only the first sentence changes.
+              Pi Rephrase Input intercepts eligible interactive prompts, adds bounded session context when available, then returns one clearer instruction to Pi. The model stays the same. The workflow stays the same. Only request wording changes.
             </p>
             <div class="hero-actions">
               <a class="button button-primary" href="#install">Install in Pi <span aria-hidden="true">↓</span></a>
@@ -121,7 +121,7 @@
               <span class="step-num">02</span>
               <div class="step-body">
                 <h3>Bound</h3>
-                <p>Use the last two conversation messages for short histories, or the full six-message buffer for longer ones. Keep up to three tool-result snapshots and no extra classifier call.</p>
+                <p>Use the last two conversation messages for histories of up to three messages, or the full bounded buffer for longer histories. Keep up to six conversation messages, three tool-result snapshots, and no extra classifier call.</p>
               </div>
               <span class="step-symbol" aria-hidden="true">◎</span>
             </li>
@@ -148,19 +148,19 @@
           <dl class="contract-list">
             <div class="contract-row">
               <dt class="mono">disabled</dt>
-              <dd>Set <span class="mono">PI_REPHRASE_OFF=1</span> and Pi receives your input unchanged. There is no other way to mis-route the prompt.</dd>
+              <dd>Set <span class="mono">PI_REPHRASE_OFF=1</span> and Pi receives your input unchanged, without a rephrase model call.</dd>
             </div>
             <div class="contract-row">
               <dt class="mono">input gates</dt>
-              <dd>Extension and RPC messages, steer and follow-up inputs, empty text, text containing <span class="mono">@</span>, slash commands, and sessions without a model or auth skip the rephrase model call. Eligible interactive input can still normalize supported clipboard images into attachments.</dd>
+              <dd>Extension and RPC messages, steer and follow-up inputs, empty text, slash commands, and sessions without a model or auth skip the rephrase model call. Mentioned files stay eligible and their references remain verbatim.</dd>
             </div>
             <div class="contract-row">
               <dt class="mono">conversation context</dt>
-              <dd>Original wording stays in a rolling buffer of six messages. Tool results keep three snapshots. Conversation and tool text are capped at 2,000 and 1,000 characters; the cwd is never scanned or sent.</dd>
+              <dd>Original wording stays in a rolling buffer of up to six messages. Tool results keep up to three snapshots. Conversation and tool text are capped at 2,000 and 1,000 characters; the cwd is never scanned or sent.</dd>
             </div>
             <div class="contract-row">
               <dt class="mono">pasted payload</dt>
-              <dd>Pasted text is marked as user payload and preserved exactly by the rephrase prompt. Attached images go to the rephrase model and return with transformed input. Pi TUI clipboard paths are decoded from its temporary directory and removed from the text.</dd>
+              <dd>Pasted text and mentioned file references stay verbatim in the rephrased prompt, even if the model omits them. Attached images go to the rephrase model and return with transformed input. Successfully loaded Pi TUI clipboard images are decoded from its temporary directory and their paths are removed from the text.</dd>
             </div>
             <div class="contract-row">
               <dt class="mono">interrupt or failure</dt>

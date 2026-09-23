@@ -149,9 +149,14 @@ test("keeps pasted text explicit in the rephrase request", async () => {
 			contextFor(cwd, registry),
 		);
 
-		assert.deepEqual(result, { action: "transform", text: "Fix the pasted error." });
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Fix the pasted error.\n\n```ts\nconst answer = await brokenCall();\n```",
+		});
 		assert.match(promptText(calls[0]), /Please fix this error:/);
 		assert.match(promptText(calls[0]), /const answer = await brokenCall\(\);/);
+		assert.doesNotMatch(promptText(calls[0]), /Text payloads to copy verbatim into output:/);
+		assert.equal(promptText(calls[0]).split("const answer = await brokenCall();").length - 1, 1);
 		assert.match(calls[0].context.systemPrompt, /pasted text.*preserve.*exactly/is);
 	} finally {
 		cleanup(cwd);
@@ -196,6 +201,175 @@ test("passes pasted images to the rephrase model and transformed input", async (
 	}
 });
 
+test("rephrases mentioned files and preserves each reference", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Review the relevant file." }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "Review @src/auth.ts and @\"docs/auth flow.md\"" },
+			contextFor(cwd, registry),
+		);
+
+		assert.equal(calls.length, 1);
+		assert.match(promptText(calls[0]), /@src\/auth\.ts/);
+		assert.match(promptText(calls[0]), /@"docs\/auth flow\.md"/);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Review the relevant file.\n\n@src/auth.ts\n\n@\"docs/auth flow.md\"",
+		});
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("rephrases a pasted image without accompanying text", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const image = {
+			type: "image" as const,
+			data: "aW1hZ2U=",
+			mimeType: "image/png",
+		};
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Inspect the pasted image." }] };
+			},
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: "", images: [image] },
+			contextFor(cwd, registry),
+		);
+
+		assert.equal(calls.length, 1);
+		assert.match(promptText(calls[0]), /User request:/);
+		assert.match(promptText(calls[0]), /Describe the attached image/);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Inspect the pasted image.",
+			images: [image],
+		});
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("preserves unstructured terminal-pasted text", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let terminalInput: ((data: string) => unknown) | undefined;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: "Handle the pasted report." }] }),
+		};
+		const { handler, fireSessionStart } = captureAllHandlers();
+		fireSessionStart({
+			mode: "tui",
+			ui: {
+				onTerminalInput: (listener: (data: string) => unknown) => {
+					terminalInput = listener;
+					return () => {};
+				},
+			},
+		});
+		terminalInput?.("\u001b[200~ERROR: pasted literally\u001b[201~");
+
+		const result = await handler(
+			{ source: "interactive", text: "Please handle this: ERROR: pasted literally" },
+			contextFor(cwd, registry),
+		);
+
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Handle the pasted report.\n\nERROR: pasted literally",
+		});
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("omits pasted text payload the model already copied verbatim", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let terminalInput: ((data: string) => unknown) | undefined;
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: "Found nothing." }] }),
+		};
+		const { handler, fireSessionStart } = captureAllHandlers();
+		fireSessionStart({ mode: "tui", ui: { onTerminalInput: (listener: (data: string) => unknown) => {
+			terminalInput = listener;
+			return () => {};
+		} } });
+		const imageBytes = Buffer.from([9]);
+		const path = join(tmpdir(), "pi-clipboard-7a11-0004.png");
+		writeFileSync(path, imageBytes);
+		try {
+			terminalInput?.(`\u001b[200~Analyse ${path}\u001b[201~`);
+			const result = await handler(
+				{ source: "interactive", text: `Analyse ${path}` },
+				contextFor(cwd, registry),
+			);
+			assert.deepEqual(result, {
+				action: "transform",
+				text: "Found nothing.",
+				images: [{ type: "image", data: imageBytes.toString("base64"), mimeType: "image/png" }],
+			});
+		} finally {
+			rmSync(path, { force: true });
+		}
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("rephrases a fully pasted request without duplicating its instruction", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		let terminalInput: ((data: string) => unknown) | undefined;
+		const original = "please fix this code:\n```ts\n  const broken = true;\n```\n";
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: "Fix the pasted code." }] }),
+		};
+		const { handler, fireSessionStart } = captureAllHandlers();
+		fireSessionStart({
+			mode: "tui",
+			ui: { onTerminalInput: (listener: (data: string) => unknown) => {
+				terminalInput = listener;
+				return () => {};
+			} },
+		});
+		terminalInput?.(`\u001b[200~${original}\u001b[201~`);
+		const result = await handler(
+			{ source: "interactive", text: original },
+			contextFor(cwd, registry),
+		);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Fix the pasted code.\n\n```ts\n  const broken = true;\n```",
+		});
+	} finally {
+		cleanup(cwd);
+	}
+});
+
 test("converts Pi's temporary clipboard image path into an attachment", async () => {
 	clearEnv();
 	const cwd = makeProject({});
@@ -229,6 +403,81 @@ test("converts Pi's temporary clipboard image path into an attachment", async ()
 		});
 	} finally {
 		rmSync(pastedImagePath, { force: true });
+		cleanup(cwd);
+	}
+});
+
+test("keeps pasted text whitespace when decoding a clipboard image", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	const pastedImagePath = join(tmpdir(), "pi-clipboard-012207-0003.png");
+	writeFileSync(pastedImagePath, Buffer.from([6]));
+	try {
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: "Inspect the content." }] }),
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: `\n  Paste:\n  code  \n ${pastedImagePath}` },
+			contextFor(cwd, registry),
+		);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: "Inspect the content.\n\n  Paste:\n  code  \n",
+			images: [{ type: "image", data: "Bg==", mimeType: "image/png" }],
+		});
+	} finally {
+		rmSync(pastedImagePath, { force: true });
+		cleanup(cwd);
+	}
+});
+
+test("keeps unreadable clipboard paths when another image loads", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	const loadedPath = join(tmpdir(), "pi-clipboard-012207-0001.png");
+	const missingPath = join(tmpdir(), "pi-clipboard-012207-0002.png");
+	writeFileSync(loadedPath, Buffer.from([4, 5]));
+	try {
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: "Inspect the available image." }] }),
+		};
+		const { handler } = captureHandler();
+		const result = await handler(
+			{ source: "interactive", text: `inspect ${loadedPath} and ${missingPath}` },
+			contextFor(cwd, registry),
+		);
+		assert.deepEqual(result, {
+			action: "transform",
+			text: `Inspect the available image.\n\n${missingPath}`,
+			images: [{ type: "image", data: "BAU=", mimeType: "image/png" }],
+		});
+	} finally {
+		rmSync(loadedPath, { force: true });
+		cleanup(cwd);
+	}
+});
+
+test("does not duplicate payloads already copied verbatim by the model", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const payload = "```text\n  ERROR: broken\n```";
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async () => ({ content: [{ type: "text", text: `Fix this:\n\n${payload}` }] }),
+		};
+		const { handler } = captureHandler();
+		assert.deepEqual(
+			await handler(
+				{ source: "interactive", text: `please fix:\n${payload}` },
+				contextFor(cwd, registry),
+			),
+			{ action: "transform", text: `Fix this:\n\n${payload}` },
+		);
+	} finally {
 		cleanup(cwd);
 	}
 });
@@ -360,6 +609,45 @@ test("always includes bounded history, even for self-contained input", async () 
 		assert.deepEqual(result, { action: "transform", text: "Rephrased fresh" });
 		assert.equal(calls.length, 1);
 		assert.match(promptText(calls[0]), /Recent conversation|earlier question|earlier answer/);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("conversation context keeps its hard character cap", async () => {
+	clearEnv();
+	const cwd = makeProject({});
+	try {
+		const calls: Call[] = [];
+		const registry = {
+			hasConfiguredAuth: () => true,
+			complete: async (_model: unknown, context: unknown, options?: Call["options"]) => {
+				calls.push({ context, options });
+				return { content: [{ type: "text", text: "Rephrased request" }] };
+			},
+		};
+		const { handler, fireSessionStart, fireMessageEnd } = captureAllHandlers();
+		fireSessionStart();
+		for (const [role, text] of [
+			["user", "u".repeat(700)],
+			["assistant", "a".repeat(700)],
+			["user", "v".repeat(700)],
+			["assistant", "b".repeat(700)],
+		] as const) {
+			fireMessageEnd({ message: role === "user" ? userMsg(text) : assistantMsg(text) });
+		}
+
+		await handler(
+			{ source: "interactive", text: "follow up" },
+			contextFor(cwd, registry),
+		);
+
+		const prompt = promptText(calls[0]);
+		const contextStart = prompt.indexOf("Recent conversation (oldest first):");
+		const requestStart = prompt.indexOf("\n\nUser request:");
+		assert.ok(contextStart >= 0);
+		assert.ok(requestStart > contextStart);
+		assert.equal(prompt.slice(contextStart, requestStart).length, 2000);
 	} finally {
 		cleanup(cwd);
 	}
@@ -772,7 +1060,6 @@ test("input gates short-circuit before any model call", async () => {
 			{ source: "rpc", text: "request" },
 			{ source: "interactive", streamingBehavior: "steer", text: "request" },
 			{ source: "interactive", streamingBehavior: "followUp", text: "request" },
-			{ source: "interactive", text: "explain @src/file.ts" },
 			{ source: "interactive", text: "/help" },
 			{ source: "interactive", text: "   " },
 		]) {

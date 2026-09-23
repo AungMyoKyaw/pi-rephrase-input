@@ -29,12 +29,12 @@ pi -p "Explain the next change in this project"
 
 1. Reset session context at `session_start` and capture original user/assistant message text plus recent tool results from `message_end`.
 2. Keep at most six user/assistant messages and three tool-result snapshots in rolling buffers.
-3. For short histories, send the last two conversation messages. For longer histories, send the full bounded conversation buffer. Cap formatted conversation at 2,000 characters and tool results at 1,000 characters.
+3. For histories of up to three conversation messages, send the last two. For longer histories, send the full bounded conversation buffer, up to six messages. Cap formatted conversation at 2,000 characters and tool results at 1,000 characters.
 4. Ask the currently selected Pi model to rephrase the original request with that context. No classifier call runs first.
-5. Preserve attached images in the rephrase request and in the transformed input returned to Pi. Detect Pi TUI clipboard paths named `pi-clipboard-...` in the system temporary directory, load supported image files as attachments, and remove those paths from the text. The rephrase prompt treats pasted text, code, logs, documents, and quoted content as payload and instructs the model to preserve it exactly.
-6. Pass the rephrased prompt back into Pi's normal input pipeline. Clipboard-only image input still returns an image attachment without a model call.
+5. Preserve pasted text, mentioned file references, and attached images in both the rephrase request and transformed input. Text payloads are copied verbatim if the model omits them. Detect Pi TUI clipboard paths named `pi-clipboard-...` in the system temporary directory, load supported image files as attachments, and remove those paths from the text.
+6. Pass the rephrased prompt back into Pi's normal input pipeline. Image-only input is still rephrased, with its image attachment preserved.
 
-The extension never scans the cwd or sends project-file contents to the model. Explicit `@file` inputs pass through unchanged so Pi can resolve them itself. The conversation buffer stores original user wording, not rephrased output.
+The extension never scans the cwd or sends project-file contents to the model. Explicit `@file` references are rephrased and preserved verbatim so Pi receives them unchanged. The conversation buffer stores original user wording, not rephrased output.
 
 ## What gets skipped
 
@@ -44,14 +44,13 @@ The extension skips the rephrase model call for any of these. For eligible inter
 - `event.source === "extension"` (messages from `sendUserMessage` or other extensions).
 - `event.source === "rpc"` (RPC clients typically manage their own context).
 - `event.streamingBehavior === "steer"` or `"followUp"` (mid-stream redirects and queued follow-ups).
-- Input containing `@` (`@file` references are resolved by Pi after the `input` event).
 - Input starting with `/` (slash commands).
 - Empty or whitespace-only input.
 - No model selected, or no auth configured for the active model.
 
 ## Fallback and interruption
 
-A timeout, thrown provider error, `stopReason: "error"`, empty response, or retry exhaustion passes the original text through unchanged and preserves attachments. `PI_REPHRASE_MAX_RETRIES` controls additional attempts after transient thrown errors; the default is two retries. Escape and Ctrl-C in TUI mode abort active rephrase requests without consuming the key, then pass the original text and attachments through. Session start and shutdown also abort active requests.
+A timeout, thrown provider error, `stopReason: "error"`, empty response, or retry exhaustion passes the original text through unchanged and preserves attachments. A successfully loaded Pi clipboard-image path is removed from the transformed text while its image attachment is preserved. `PI_REPHRASE_MAX_RETRIES` controls additional attempts after transient thrown errors; the default is two retries. Escape and Ctrl-C in TUI mode abort active rephrase requests without consuming the key, then pass the original text and attachments through. Session start and shutdown also abort active requests.
 
 ## Configuration
 

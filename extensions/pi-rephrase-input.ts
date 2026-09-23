@@ -100,8 +100,54 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	// wording — violating the README contract on every turn after the
 	// first. FIFO ordering removes the timestamp dependency entirely.
 	const pendingOriginals: { text: string }[] = [];
+	const pendingPastedTexts: string[] = [];
 	const activeRephraseControllers = new Set<AbortController>();
+	let terminalPasteBuffer = "";
+	let terminalPasteActive = false;
 	let removeTerminalInputListener: (() => void) | undefined;
+
+	function captureTerminalPastes(data: string): void {
+		const pasteStart = "\u001b[200~";
+		const pasteEnd = "\u001b[201~";
+		let remaining = data;
+
+		while (remaining.length > 0) {
+			if (!terminalPasteActive) {
+				const startIndex = remaining.indexOf(pasteStart);
+				if (startIndex === -1) return;
+				remaining = remaining.slice(startIndex + pasteStart.length);
+				terminalPasteActive = true;
+				continue;
+			}
+
+			const endIndex = remaining.indexOf(pasteEnd);
+			if (endIndex === -1) {
+				terminalPasteBuffer += remaining;
+				return;
+			}
+
+			const pastedText = terminalPasteBuffer + remaining.slice(0, endIndex);
+			if (pastedText.length > 0) pendingPastedTexts.push(pastedText);
+			if (pendingPastedTexts.length > 16) pendingPastedTexts.shift();
+			terminalPasteBuffer = "";
+			terminalPasteActive = false;
+			remaining = remaining.slice(endIndex + pasteEnd.length);
+		}
+	}
+
+	function takePastedTextPayloads(text: string): string[] {
+		const payloads: string[] = [];
+		for (const pastedText of pendingPastedTexts) {
+			const comparableText = pastedText.trim();
+			if (text.includes(pastedText) || (comparableText && text.includes(comparableText))) {
+				payloads.push(pastedText);
+			}
+		}
+		// A paste belongs only to the next submitted input, even if it was
+		// removed from the editor before submission.
+		pendingPastedTexts.length = 0;
+		return payloads;
+	}
 
 	function recordTurn(role: "user" | "assistant", text: string): void {
 		const trimmed = text.trim();
@@ -134,12 +180,10 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		}
 		const joined = lines.join("\n");
 		if (joined.length <= MAX_CONVERSATION_CHARS) return joined;
-		// Keep the most recent turns; truncate the front.
-		const overflow = joined.length - MAX_CONVERSATION_CHARS;
-		const tail = joined.slice(overflow);
-		// Re-add the header if we cut it off.
+		// Keep the header and most recent turns within the hard character cap.
 		const header = "Recent conversation (oldest first):";
-		return tail.startsWith(header) ? tail : `${header}\n${tail}`;
+		const tailLength = MAX_CONVERSATION_CHARS - header.length - 1;
+		return `${header}\n${joined.slice(-tailLength)}`;
 	}
 
 	function formatToolResultContext(depth: HistoryDepth): string {
@@ -211,6 +255,9 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		conversationBuffer.length = 0;
 		toolResultBuffer.length = 0;
 		pendingOriginals.length = 0;
+		pendingPastedTexts.length = 0;
+		terminalPasteBuffer = "";
+		terminalPasteActive = false;
 		abortActiveRephrases();
 		removeTerminalInputListener?.();
 		removeTerminalInputListener = undefined;
@@ -222,6 +269,7 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 		// interrupt behavior after this listener runs.
 		if (ctx?.mode === "tui") {
 			removeTerminalInputListener = ctx.ui.onTerminalInput((data) => {
+				captureTerminalPastes(data);
 				if (data === "\u001b" || data === "\u0003") {
 					abortActiveRephrases();
 				}
@@ -281,6 +329,10 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 	const DEFAULT_RETRY_BASE_MS = 500;
 	const CLIPBOARD_IMAGE_REFERENCE =
 		/((?:(?:[A-Za-z]:)?[/\\][^\s"'`]*?)?pi-clipboard-[0-9a-f-]+\.(?:png|jpe?g|gif|webp|bmp))(?=$|[\s"'`])/giu;
+	const MENTIONED_FILE_REFERENCE = /(?<![\w@])@(?:"[^"\r\n]+"|[^\s"'`)}\],;]+)/gu;
+	const FENCED_TEXT_PAYLOAD =
+		/^[ \t]*(`{3,}|~{3,})[^\r\n]*(?:\r?\n)[\s\S]*?^[ \t]*\1[ \t]*\r?$/gmu;
+	const FILE_TEXT_PAYLOAD = /<file\b[^>]*>[\s\S]*?<\/file>/giu;
 	const CLIPBOARD_IMAGE_MIME_TYPES: Record<string, string> = {
 		".png": "image/png",
 		".jpg": "image/jpeg",
@@ -306,7 +358,7 @@ export default function rephraseInput(pi: ExtensionAPI): void {
 
 	const REPHRASE_SYSTEM_PROMPT = `You are a request rephraser for a coding agent. Your only job: take the user's raw request and rewrite it as a clear, actionable prompt that another LLM can execute well.
 
-The user input may contain pasted text such as code, logs, documents, or quoted content, plus attached images. Treat pasted material and images as user-provided payload, not as instructions to rephrase. Preserve pasted text exactly, including wording, whitespace, punctuation, and code formatting. Do not summarize, translate, normalize, or omit pasted text. Keep attached images available to the downstream agent. If the input contains only pasted material and no separate request, return that material unchanged.
+The user input may contain pasted text such as code, logs, documents, or quoted content, plus attached images and mentioned files. Treat pasted material, images, and file references as user-provided payload, not as instructions to rephrase. Preserve every payload exactly, including wording, whitespace, punctuation, code formatting, file-reference spelling, and attachment bytes. Do not summarize, translate, normalize, or omit payloads. The output MUST include every supplied text payload unchanged and keep every supplied image attached. Rephrase only the surrounding request. If the input contains only payload, return that payload unchanged.
 
 You may be given two context blocks before the user's request:
 - "Recent conversation": prior turns in this session. Use to resolve pronouns, references like "fix that", and follow-ups that depend on earlier intent.
@@ -453,11 +505,16 @@ Rules (in strict priority order):
 		const conversationSection = formatConversationContext(depth);
 		const toolResultSection = formatToolResultContext(depth);
 
+		// Send each payload only once, inside the original request. Copying
+		// it into an extra user-message section makes models echo that section
+		// into the prompt Pi ultimately receives.
 		const sections = [
 			conversationSection,
 			toolResultSection,
 			"User request:",
-			originalText,
+			originalText.length > 0
+				? originalText
+				: "Describe the attached image. Ask the user for more detail only when necessary.",
 		].filter((s) => s.length > 0);
 
 		const userMsg = {
@@ -488,14 +545,91 @@ Rules (in strict priority order):
 		return text.length > 0 ? text : null;
 	}
 
-	async function loadClipboardImages(text: string): Promise<ImageContent[]> {
+	function collectTextPayloads(text: string, pastedTexts: readonly string[]): string[] {
+		const candidates: Array<{ index: number; text: string }> = [];
+		const addCandidate = (payload: string, index: number): void => {
+			if (!payload) return;
+			candidates.push({ index, text: payload });
+		};
+
+		const entireInputWasPasted = pastedTexts.some((pastedText) => pastedText.trim() === text.trim());
+		for (const pastedText of pastedTexts) {
+			// A pasted prompt can contain both an instruction and a payload.
+			// Do not copy the entire instruction back after rephrasing it.
+			if (pastedText.trim() === text.trim()) continue;
+			const index = text.indexOf(pastedText);
+			const trimmedIndex = index === -1 ? text.indexOf(pastedText.trim()) : index;
+			if (trimmedIndex !== -1) addCandidate(pastedText, trimmedIndex);
+		}
+		for (const match of text.matchAll(FENCED_TEXT_PAYLOAD)) {
+			if (match[0] !== undefined && match.index !== undefined) {
+				addCandidate(match[0], match.index);
+			}
+		}
+		for (const match of text.matchAll(FILE_TEXT_PAYLOAD)) {
+			if (match[0] !== undefined && match.index !== undefined) {
+				addCandidate(match[0], match.index);
+			}
+		}
+		for (const match of text.matchAll(CLIPBOARD_IMAGE_REFERENCE)) {
+			if (match[0] !== undefined && match.index !== undefined) {
+				addCandidate(match[0], match.index);
+			}
+		}
+		for (const match of text.matchAll(MENTIONED_FILE_REFERENCE)) {
+			if (match[0] !== undefined && match.index !== undefined) {
+				addCandidate(match[0], match.index);
+			}
+		}
+
+		// Pi does not expose paste boundaries on InputEvent. For an unstructured
+		// multiline paste, preserve everything after the first line as payload.
+		if (
+			(pastedTexts.length === 0 || entireInputWasPasted) &&
+			text.includes("\n") &&
+			!text.match(FENCED_TEXT_PAYLOAD) &&
+			!text.match(FILE_TEXT_PAYLOAD)
+		) {
+			const firstLineEnd = text.search(/\r?\n/);
+			if (firstLineEnd !== -1) {
+				const payloadStart = firstLineEnd + (text[firstLineEnd] === "\r" ? 2 : 1);
+				addCandidate(text.slice(payloadStart), payloadStart);
+			}
+		}
+
+		candidates.sort((left, right) => left.index - right.index || right.text.length - left.text.length);
+		const selected: Array<{ index: number; text: string }> = [];
+		for (const candidate of candidates) {
+			const isCovered = selected.some(
+				(other) =>
+					other.index <= candidate.index &&
+					other.index + other.text.length >= candidate.index + candidate.text.length,
+			);
+			if (!isCovered && !selected.some((other) => other.text === candidate.text)) {
+				selected.push(candidate);
+			}
+		}
+		return selected.map((candidate) => candidate.text);
+	}
+
+	function includeTextPayloads(rephrased: string, payloads: readonly string[]): string {
+		let result = rephrased.trim();
+		for (const payload of payloads) {
+			if (!payload || result.includes(payload)) continue;
+			if (result.length > 0 && !result.endsWith("\n")) result += "\n\n";
+			result += payload;
+		}
+		return result;
+	}
+
+	async function loadClipboardImages(text: string): Promise<Array<{ path: string; image: ImageContent }>> {
 		const paths = [...text.matchAll(CLIPBOARD_IMAGE_REFERENCE)]
 			.map((match) => match[1])
 			.filter((path): path is string => typeof path === "string");
 		if (paths.length === 0) return [];
 
 		const temporaryDirectory = resolve(tmpdir());
-		const images: ImageContent[] = [];
+		const images: Array<{ path: string; image: ImageContent }> = [];
 		for (const path of paths) {
 			const absolutePath = resolve(path);
 			const fileName = basename(absolutePath);
@@ -511,7 +645,7 @@ Rules (in strict priority order):
 			}
 			try {
 				const data = await readFile(absolutePath);
-				images.push({ type: "image", data: data.toString("base64"), mimeType });
+				images.push({ path, image: { type: "image", data: data.toString("base64"), mimeType } });
 			} catch {
 				// Keep original path when clipboard file disappeared or cannot be read.
 			}
@@ -519,8 +653,14 @@ Rules (in strict priority order):
 		return images;
 	}
 
-	function removeClipboardImageReferences(text: string): string {
-		return text.replace(CLIPBOARD_IMAGE_REFERENCE, "").trim();
+	function removeClipboardImageReferences(text: string, loadedPaths: readonly string[]): string {
+		const loaded = new Set(loadedPaths);
+		const result = text.replace(CLIPBOARD_IMAGE_REFERENCE, (path) => loaded.has(path) ? "" : path);
+		// Remove the single separator left by a trailing image path, not
+		// whitespace belonging to pasted text elsewhere in the request.
+		return loadedPaths.some((path) => text.endsWith(` ${path}`))
+			? result.slice(0, -1)
+			: result;
 	}
 
 	// ── Input handler — gates, interrupt, env config, flow ──────
@@ -540,12 +680,14 @@ Rules (in strict priority order):
 		const clipboardImages = await loadClipboardImages(event.text);
 		const inputText =
 			clipboardImages.length > 0
-				? removeClipboardImageReferences(event.text)
+				? removeClipboardImageReferences(event.text, clipboardImages.map(({ path }) => path))
 				: event.text;
 		const inputImages =
 			clipboardImages.length > 0
-				? [...(event.images ?? []), ...clipboardImages]
+				? [...(event.images ?? []), ...clipboardImages.map(({ image }) => image)]
 				: event.images;
+		const pastedTextPayloads = takePastedTextPayloads(inputText);
+		const textPayloads = collectTextPayloads(inputText, pastedTextPayloads);
 		const passThrough = () =>
 			clipboardImages.length > 0
 				? {
@@ -555,10 +697,8 @@ Rules (in strict priority order):
 					}
 				: { action: "continue" as const };
 
-		// `@file` references — the `input` event sees raw text BEFORE Pi
-		// resolves `@file` to file contents. Rephrasing here would preserve
-		// an unresolved reference and could distort the explicit file request.
-		if (inputText.includes("@")) return passThrough();
+		// Mentioned files and other payload references stay in inputText so the
+		// rephrase model can include them unchanged in its output.
 
 		// Slash-command-shaped input — if no extension command matched,
 		// `/foo bar` reaches us as prose. Rephrasing it produces "Execute
@@ -566,9 +706,16 @@ Rules (in strict priority order):
 		// leading `/` and invents intent.
 		if (inputText.startsWith("/")) return passThrough();
 
-		// Empty / whitespace-only input — nothing to rephrase. Clipboard-only
-		// input still needs a transform so Pi receives the decoded image.
-		if (inputText.trim().length === 0) return passThrough();
+		// Empty text without an image attachment — nothing to rephrase.
+		// Image-only input still flows through; whitespace-only text does not.
+		if (inputText.trim().length === 0 && (inputImages?.length ?? 0) === 0) {
+			return passThrough();
+		}
+		if (inputText.length === 0 && (inputImages?.length ?? 0) > 0) {
+			// image-only path; fall through to rephrase.
+		} else if (inputText.trim().length === 0) {
+			return passThrough();
+		}
 
 		// User interrupt — honor before any work, including notify.
 		const userSignal = c.signal;
@@ -646,6 +793,8 @@ Rules (in strict priority order):
 			return passThrough();
 		}
 
+		const rephrasedWithPayloads = includeTextPayloads(rephrased, textPayloads);
+
 		if (c.hasUI)
 			c.ui!.notify(
 				`Rephrased via ${(model as { id?: string }).id ?? "model"}`,
@@ -653,12 +802,12 @@ Rules (in strict priority order):
 			);
 		if (debug) {
 			process.stderr.write(
-				`\n===[REPHRASE]===\n${rephrased}\n===[END]===\n\n`,
+				`\n===[REPHRASE]===\n${rephrasedWithPayloads}\n===[END]===\n\n`,
 			);
 		}
 		return {
 			action: "transform",
-			text: rephrased,
+			text: rephrasedWithPayloads,
 			...(inputImages === undefined ? {} : { images: inputImages }),
 		};
 	});
